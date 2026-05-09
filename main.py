@@ -29,7 +29,7 @@ app = FastAPI(
 def get_serviceability_date(
     pickup_postcode: str = Query(...),
     delivery_postcode: str = Query(...),
-    weight: float = Query(..., gt=0),
+    weight: float = Query(..., ge=0.5),
     cod: int = Query(..., ge=0, le=1),
 ):
     query_params = urlencode(
