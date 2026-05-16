@@ -18,6 +18,18 @@ You can also trigger the same task manually from the API docs with:
 POST /api/shipments/edd-breaches/run
 ```
 
+Operational checks:
+
+```bash
+GET /api/shipments/edd-breaches/health
+POST /api/shipments/edd-breaches/db/migrate
+```
+
+The health endpoint verifies Supabase config, Supabase REST reachability, required
+`public` tables, and Shiprocket credentials. The migration endpoint applies
+pending SQL files from `db/migrations/` using `POSTGRES_URL_NON_POOLING` or
+`POSTGRES_URL`, and records successful filenames in `public.app_migrations`.
+
 Vercel runs it every day at `03:30 UTC` / `09:00 IST` through `vercel.json`.
 
 The job:
@@ -57,11 +69,17 @@ SHIPROCKET_PER_PAGE=100
 EDD_REPORT_DIR=reports
 ```
 
+For Shiprocket auth, either provide `SHIPROCKET_TOKEN` directly or provide both
+`SHIPROCKET_EMAIL` and `SHIPROCKET_PASSWORD` for an API user so the app can log
+in and refresh the token automatically.
+
 For local testing:
 
 ```bash
 curl "http://localhost:3000/api/jobs/edd-breach/run?dry_run=true"
 curl -X POST "http://localhost:3000/api/shipments/edd-breaches/run?dry_run=true"
+curl "http://localhost:3000/api/shipments/edd-breaches/health"
+curl -X POST "http://localhost:3000/api/shipments/edd-breaches/db/migrate"
 ```
 
 If `EDD_JOB_CRON_SECRET` or `CRON_SECRET` is set, call the endpoint with:

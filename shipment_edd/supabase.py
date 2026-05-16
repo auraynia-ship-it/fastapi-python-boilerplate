@@ -30,6 +30,30 @@ class SupabaseRestClient:
             prefer=f"resolution=merge-duplicates,return={returning}",
         )
 
+    def table_exists(self, table):
+        if not self.enabled:
+            return False, "Supabase URL/key are not configured."
+
+        query = urlencode({"select": "*", "limit": 1})
+        request = Request(
+            f"{self.url}/rest/v1/{table}?{query}",
+            headers={
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+            },
+            method="GET",
+        )
+
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                response.read()
+            return True, None
+        except HTTPError as error:
+            detail = error.read().decode("utf-8") if error.fp else error.reason
+            return False, f"Supabase API error {error.code}: {detail}"
+        except (URLError, TimeoutError) as error:
+            return False, f"Unable to reach Supabase REST API: {error}"
+
     def _write(self, table, rows, query="", prefer="return=representation", returning=None):
         if not self.enabled:
             return []
@@ -63,4 +87,3 @@ class SupabaseRestClient:
             raise SupabaseError(f"Supabase API error {error.code}: {detail}") from error
         except (URLError, TimeoutError, json.JSONDecodeError) as error:
             raise SupabaseError(f"Unable to call Supabase REST API: {error}") from error
-

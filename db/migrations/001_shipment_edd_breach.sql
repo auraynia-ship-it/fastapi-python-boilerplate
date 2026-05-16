@@ -1,5 +1,12 @@
 create extension if not exists pgcrypto;
 
+create table if not exists public.app_migrations (
+    id bigserial primary key,
+    filename text not null unique,
+    checksum text not null,
+    applied_at timestamptz not null default now()
+);
+
 create table if not exists public.shipment_edd_job_runs (
     id uuid primary key default gen_random_uuid(),
     job_name text not null default 'shipment_edd_breach',
@@ -75,3 +82,4 @@ before update on public.shipment_snapshots
 for each row
 execute function public.touch_shipment_snapshot_updated_at();
 
+notify pgrst, 'reload schema';

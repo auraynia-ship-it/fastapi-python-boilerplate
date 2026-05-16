@@ -9,6 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from shipment_edd.config import get_edd_job_settings, load_env_file
+from shipment_edd.health import check_edd_system_health, run_edd_migration
 from shipment_edd.job import run_edd_breach_job
 
 
@@ -184,7 +185,7 @@ def get_serviceability_date(
     return {"date": (earliest_etd + timedelta(days=1)).isoformat()}
 
 
-@app.get("/api/jobs/edd-breach/run")
+@app.get("/api/jobs/edd-breach/run", include_in_schema=False)
 def run_shipment_edd_breach_job(
     dry_run: bool = Query(False),
     authorization: str | None = Header(default=None),
@@ -193,7 +194,7 @@ def run_shipment_edd_breach_job(
     return execute_shipment_edd_breach_job(dry_run, authorization, x_cron_secret)
 
 
-@app.post("/api/shipments/edd-breaches/run")
+@app.post("/api/shipments/edd-breaches/run", summary="Run Shipment EDD Breach Job")
 def run_shipment_edd_breach_job_endpoint(
     dry_run: bool = Query(False),
     authorization: str | None = Header(default=None),
@@ -202,16 +203,33 @@ def run_shipment_edd_breach_job_endpoint(
     return execute_shipment_edd_breach_job(dry_run, authorization, x_cron_secret)
 
 
+@app.get("/api/db/health", summary="Check Shipment EDD System Health")
+def check_shipment_edd_health():
+    return check_edd_system_health()
+
+
+@app.post("/api/db/migrate", summary="Run Shipment EDD DB Migration")
+def run_shipment_edd_db_migration(
+    authorization: str | None = Header(default=None),
+    x_cron_secret: str | None = Header(default=None),
+):
+    validate_job_secret(authorization, x_cron_secret)
+
+    try:
+        return run_edd_migration()
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Shipment EDD migration failed: {error}",
+        ) from error
+
+
 def execute_shipment_edd_breach_job(
     dry_run: bool,
     authorization: str | None,
     x_cron_secret: str | None,
 ):
-    settings = get_edd_job_settings()
-    if settings.cron_secret:
-        bearer = f"Bearer {settings.cron_secret}"
-        if authorization != bearer and x_cron_secret != settings.cron_secret:
-            raise HTTPException(status_code=401, detail="Invalid cron secret.")
+    validate_job_secret(authorization, x_cron_secret)
 
     try:
         return run_edd_breach_job(dry_run=dry_run)
@@ -220,3 +238,14 @@ def execute_shipment_edd_breach_job(
             status_code=502,
             detail=f"Shipment EDD breach job failed: {error}",
         ) from error
+
+
+def validate_job_secret(
+    authorization: str | None,
+    x_cron_secret: str | None,
+):
+    settings = get_edd_job_settings()
+    if settings.cron_secret:
+        bearer = f"Bearer {settings.cron_secret}"
+        if authorization != bearer and x_cron_secret != settings.cron_secret:
+            raise HTTPException(status_code=401, detail="Invalid cron secret.")

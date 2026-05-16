@@ -24,7 +24,8 @@ class ShiprocketClient:
     def refresh_token(self):
         if not self.email or not self.password:
             raise ShiprocketError(
-                "SHIPROCKET_EMAIL and SHIPROCKET_PASSWORD are required to refresh token."
+                "Set SHIPROCKET_TOKEN, or set both SHIPROCKET_EMAIL and "
+                "SHIPROCKET_PASSWORD so the job can refresh a Shiprocket token."
             )
 
         response_data = self._request(
@@ -124,4 +125,3 @@ def extract_orders(response):
             return value
 
     return []
-

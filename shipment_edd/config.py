@@ -26,6 +26,7 @@ class EddJobSettings:
     shiprocket_password: str | None
     supabase_url: str | None
     supabase_key: str | None
+    postgres_url: str | None
     cron_secret: str | None
     order_window_days: int
     max_pages: int
@@ -54,6 +55,11 @@ def get_edd_job_settings():
             os.getenv("SUPABASE_SERVICE_ROLE_KEY")
             or os.getenv("SUPABASE_SECRET_KEY")
             or os.getenv("SUPABASE_ANON_KEY")
+        ),
+        postgres_url=(
+            os.getenv("POSTGRES_URL_NON_POOLING")
+            or os.getenv("POSTGRES_URL")
+            or os.getenv("POSTGRES_PRISMA_URL")
         ),
         cron_secret=os.getenv("EDD_JOB_CRON_SECRET") or os.getenv("CRON_SECRET"),
         order_window_days=_int_env("SHIPROCKET_ORDER_WINDOW_DAYS", 45),
