@@ -71,7 +71,7 @@ def refresh_token():
     except (URLError, TimeoutError, json.JSONDecodeError) as error:
         raise HTTPException(
             status_code=502,
-            detail=f"Unable to refresh Shiprocket token: {error}",
+            detail=f"Unable to refresh Shiprocket  token: {error}",
         ) from error
 
     token = response_data.get("token")
