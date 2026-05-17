@@ -28,6 +28,9 @@ class EddJobSettings:
     supabase_key: str | None
     postgres_url: str | None
     cron_secret: str | None
+    blob_rw_token: str | None
+    blob_access: str
+    blob_prefix: str
     order_window_days: int
     max_pages: int
     per_page: int
@@ -62,6 +65,9 @@ def get_edd_job_settings():
             or os.getenv("POSTGRES_PRISMA_URL")
         ),
         cron_secret=os.getenv("EDD_JOB_CRON_SECRET") or os.getenv("CRON_SECRET"),
+        blob_rw_token=os.getenv("BLOB_READ_WRITE_TOKEN"),
+        blob_access=os.getenv("EDD_REPORT_BLOB_ACCESS", "public"),
+        blob_prefix=os.getenv("EDD_REPORT_BLOB_PREFIX", "edd-breach-reports"),
         order_window_days=_int_env("SHIPROCKET_ORDER_WINDOW_DAYS", 45),
         max_pages=_int_env("SHIPROCKET_MAX_PAGES", 20),
         per_page=_int_env("SHIPROCKET_PER_PAGE", 100),

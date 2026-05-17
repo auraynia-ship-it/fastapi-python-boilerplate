@@ -4,6 +4,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import get_edd_job_settings
+from .blob_store import upload_bytes_to_vercel_blob
 from .shiprocket import ShiprocketClient
 from .supabase import SupabaseRestClient
 
@@ -52,7 +53,17 @@ def run_edd_breach_job(today=None, dry_run=False):
             if is_edd_breached(snapshot, today):
                 breaches.append(build_breach(snapshot, today))
 
-    report_path = write_breach_csv(breaches, settings.report_dir, today)
+    report_csv_path = write_breach_csv(breaches, settings.report_dir, today)
+    report_pdf_path = write_breach_pdf(breaches, settings.report_dir, today)
+    report_blob_url = None
+    if report_pdf_path and settings.blob_rw_token:
+        report_blob_url = upload_report_to_blob(
+            local_path=report_pdf_path,
+            today=today,
+            prefix=settings.blob_prefix,
+            access=settings.blob_access,
+            token=settings.blob_rw_token,
+        )
     completed_at = datetime.now(timezone.utc)
 
     job_run = {
@@ -63,7 +74,10 @@ def run_edd_breach_job(today=None, dry_run=False):
         "orders_fetched": len(orders),
         "shipments_checked": len(snapshots),
         "breaches_found": len(breaches),
-        "report_path": str(report_path),
+        "report_path": str(report_blob_url or report_pdf_path or report_csv_path),
+        "report_csv_path": str(report_csv_path) if report_csv_path else None,
+        "report_pdf_path": str(report_pdf_path) if report_pdf_path else None,
+        "report_blob_url": report_blob_url,
         "awb_codes": [breach["awb_code"] for breach in breaches],
     }
 
@@ -101,7 +115,7 @@ def run_edd_breach_job(today=None, dry_run=False):
         "shipments_checked": len(snapshots),
         "breaches_found": len(breaches),
         "breached_awbs": awb_codes,
-        "report_path": str(report_path),
+        "report_path": str(report_blob_url or report_pdf_path or report_csv_path),
     }
 
 
@@ -222,6 +236,68 @@ def write_breach_csv(breaches, report_dir, today):
     return report_path
 
 
+def write_breach_pdf(breaches, report_dir, today):
+    if not breaches:
+        return None
+
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units import mm
+        from reportlab.pdfgen import canvas
+    except ImportError:
+        return None
+
+    path = Path(report_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    report_path = path / f"shipment_edd_breaches_{today.isoformat()}.pdf"
+
+    c = canvas.Canvas(str(report_path), pagesize=A4)
+    width, height = A4
+    x = 15 * mm
+    y = height - 20 * mm
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x, y, f"Shipment EDD Breaches - {today.isoformat()}")
+    y -= 10 * mm
+
+    c.setFont("Helvetica", 9)
+    headers = ["AWB", "EDD", "Days", "Courier", "Status"]
+    c.drawString(x, y, " | ".join(headers))
+    y -= 6 * mm
+
+    for breach in breaches:
+        line = " | ".join(
+            [
+                str(breach.get("awb_code") or ""),
+                str(breach.get("edd") or ""),
+                str(breach.get("days_delayed") or ""),
+                str(breach.get("courier_name") or "")[:24],
+                str(breach.get("status") or "")[:18],
+            ]
+        )
+        c.drawString(x, y, line)
+        y -= 5 * mm
+        if y < 15 * mm:
+            c.showPage()
+            y = height - 20 * mm
+            c.setFont("Helvetica", 9)
+
+    c.save()
+    return report_path
+
+
+def upload_report_to_blob(*, local_path, today, prefix, access, token):
+    content = Path(local_path).read_bytes()
+    pathname = f"{prefix}/shipment_edd_breaches_{today.isoformat()}.pdf"
+    result = upload_bytes_to_vercel_blob(
+        pathname=pathname,
+        content=content,
+        content_type="application/pdf",
+        access=access,
+        token=token,
+    )
+    return result.url
+
+
 def first_value(mapping, keys):
     if not isinstance(mapping, dict):
         return None
@@ -273,4 +349,3 @@ def parse_date(value):
         return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
     except ValueError:
         return None
-
