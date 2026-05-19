@@ -97,6 +97,13 @@ For Shiprocket auth, either provide `SHIPROCKET_TOKEN` directly or provide both
 `SHIPROCKET_EMAIL` and `SHIPROCKET_PASSWORD` for an API user so the app can log
 in and refresh the token automatically.
 
+For Vercel deployments, set `SHIPROCKET_EMAIL` and `SHIPROCKET_PASSWORD` in the
+Vercel project environment variables for Production, Preview, and Development as
+needed. The local `.env` file is only used on your machine and is not deployed to
+Vercel. Prefer credentials over a pasted `SHIPROCKET_TOKEN`, because Shiprocket
+tokens expire and the app can only refresh them when both credentials are
+available.
+
 For local testing:
 
 ```bash

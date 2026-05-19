@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 SHIPROCKET_BASE_URL = "https://apiv2.shiprocket.in/v1/external"
 SHIPROCKET_LOGIN_URL = f"{SHIPROCKET_BASE_URL}/auth/login"
 SHIPROCKET_ORDERS_URL = f"{SHIPROCKET_BASE_URL}/orders"
+SHIPROCKET_SERVICEABILITY_URL = f"{SHIPROCKET_BASE_URL}/courier/serviceability/"
 
 
 class ShiprocketError(RuntimeError):
@@ -62,6 +63,15 @@ class ShiprocketClient:
                 break
 
         return orders
+
+    def fetch_serviceability(self, pickup_postcode, delivery_postcode, weight, cod):
+        params = {
+            "pickup_postcode": pickup_postcode,
+            "delivery_postcode": delivery_postcode,
+            "weight": weight,
+            "cod": cod,
+        }
+        return self._request(f"{SHIPROCKET_SERVICEABILITY_URL}?{urlencode(params)}")
 
     def _request(
         self,
