@@ -1,4 +1,5 @@
 import csv
+import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -19,12 +20,27 @@ DATE_FIELDS = (
 DELIVERED_FIELDS = ("delivered_date", "delivery_date", "actual_delivery_date")
 RTO_FIELDS = ("rto_initiated_date", "rto_delivered_date", "rto_date")
 AWB_FIELDS = ("awb_code", "awb", "awb_number")
+logger = logging.getLogger(__name__)
 
 
 def run_edd_breach_job(today=None, dry_run=False):
     settings = get_edd_job_settings()
     today = today or business_today(settings.timezone)
     started_at = datetime.now(timezone.utc)
+    logger.info(
+        "edd_breach_job_started dry_run=%s today=%s timezone=%s order_window_days=%s "
+        "shiprocket_token_present=%s shiprocket_credentials_present=%s "
+        "supabase_configured=%s blob_store_configured=%s report_dir=%s",
+        dry_run,
+        today.isoformat(),
+        settings.timezone,
+        settings.order_window_days,
+        bool(settings.shiprocket_token),
+        bool(settings.shiprocket_email and settings.shiprocket_password),
+        bool(settings.supabase_url and settings.supabase_key),
+        bool(settings.blob_rw_token),
+        settings.report_dir,
+    )
 
     shiprocket = ShiprocketClient(
         token=settings.shiprocket_token,
@@ -40,6 +56,14 @@ def run_edd_breach_job(today=None, dry_run=False):
         max_pages=settings.max_pages,
         per_page=settings.per_page,
     )
+    logger.info(
+        "edd_breach_orders_fetched count=%s start_date=%s end_date=%s max_pages=%s per_page=%s",
+        len(orders),
+        start_date.isoformat(),
+        today.isoformat(),
+        settings.max_pages,
+        settings.per_page,
+    )
     snapshots = []
     breaches = []
 
@@ -52,18 +76,56 @@ def run_edd_breach_job(today=None, dry_run=False):
 
             if is_edd_breached(snapshot, today):
                 breaches.append(build_breach(snapshot, today))
+    logger.info(
+        "edd_breach_shipments_evaluated shipments_checked=%s breaches_found=%s",
+        len(snapshots),
+        len(breaches),
+    )
 
     report_csv_path = write_breach_csv(breaches, settings.report_dir, today)
     report_pdf_path = write_breach_pdf(breaches, settings.report_dir, today)
+    logger.info(
+        "edd_breach_reports_created csv_path=%s pdf_path=%s",
+        report_csv_path,
+        report_pdf_path,
+    )
     report_blob_url = None
-    if report_pdf_path and settings.blob_rw_token:
-        report_blob_url = upload_report_to_blob(
-            local_path=report_pdf_path,
-            today=today,
-            prefix=settings.blob_prefix,
-            access=settings.blob_access,
-            token=settings.blob_rw_token,
+    report_blob_upload = {
+        "attempted": False,
+        "uploaded": False,
+        "skipped_reason": None,
+    }
+    if dry_run:
+        report_blob_upload["skipped_reason"] = "dry_run_enabled"
+        logger.info("edd_breach_blob_upload_skipped reason=dry_run_enabled")
+    elif not report_pdf_path:
+        report_blob_upload["skipped_reason"] = "pdf_report_not_created"
+        logger.warning("edd_breach_blob_upload_skipped reason=pdf_report_not_created")
+    elif not settings.blob_rw_token:
+        report_blob_upload["skipped_reason"] = "BLOB_READ_WRITE_TOKEN is not configured"
+        logger.warning("edd_breach_blob_upload_skipped reason=blob_token_missing")
+    else:
+        report_blob_upload["attempted"] = True
+        logger.info(
+            "edd_breach_blob_upload_started pdf_path=%s prefix=%s access=%s",
+            report_pdf_path,
+            settings.blob_prefix,
+            settings.blob_access,
         )
+        try:
+            report_blob_url = upload_report_to_blob(
+                local_path=report_pdf_path,
+                today=today,
+                prefix=settings.blob_prefix,
+                access=settings.blob_access,
+                token=settings.blob_rw_token,
+            )
+        except Exception:
+            logger.exception("edd_breach_blob_upload_failed pdf_path=%s", report_pdf_path)
+            raise
+        report_blob_upload["uploaded"] = True
+        report_blob_upload["url"] = report_blob_url
+        logger.info("edd_breach_blob_upload_completed url=%s", report_blob_url)
     completed_at = datetime.now(timezone.utc)
 
     job_run = {
@@ -82,8 +144,10 @@ def run_edd_breach_job(today=None, dry_run=False):
     }
 
     if not dry_run:
+        logger.info("edd_breach_persist_started")
         persisted_run = supabase.insert("shipment_edd_job_runs", job_run)
         job_run_id = persisted_run[0].get("id") if persisted_run else None
+        logger.info("edd_breach_job_run_persisted job_run_id=%s", job_run_id)
 
         if snapshots:
             supabase.upsert(
@@ -92,6 +156,7 @@ def run_edd_breach_job(today=None, dry_run=False):
                 on_conflict="awb_code",
                 returning="minimal",
             )
+            logger.info("edd_breach_snapshots_upserted count=%s", len(snapshots))
 
         if breaches:
             breach_rows = [
@@ -104,9 +169,20 @@ def run_edd_breach_job(today=None, dry_run=False):
                 on_conflict="awb_code,breach_date",
                 returning="minimal",
             )
+            logger.info("edd_breach_rows_upserted count=%s", len(breaches))
+    else:
+        logger.info("edd_breach_persist_skipped reason=dry_run_enabled")
 
     awb_codes = [breach["awb_code"] for breach in breaches]
-    print(f"EDD breached AWBs: {', '.join(awb_codes) if awb_codes else 'none'}")
+    logger.info(
+        "edd_breach_job_completed orders_fetched=%s shipments_checked=%s "
+        "breaches_found=%s report_blob_url_present=%s breached_awbs=%s",
+        len(orders),
+        len(snapshots),
+        len(breaches),
+        bool(report_blob_url),
+        ",".join(awb_codes) if awb_codes else "none",
+    )
 
     return {
         "status": "completed",
@@ -116,6 +192,10 @@ def run_edd_breach_job(today=None, dry_run=False):
         "breaches_found": len(breaches),
         "breached_awbs": awb_codes,
         "report_path": str(report_blob_url or report_pdf_path or report_csv_path),
+        "report_csv_path": str(report_csv_path) if report_csv_path else None,
+        "report_pdf_path": str(report_pdf_path) if report_pdf_path else None,
+        "report_blob_url": report_blob_url,
+        "report_blob_upload": report_blob_upload,
     }
 
 
@@ -237,15 +317,13 @@ def write_breach_csv(breaches, report_dir, today):
 
 
 def write_breach_pdf(breaches, report_dir, today):
-    if not breaches:
-        return None
-
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.units import mm
         from reportlab.pdfgen import canvas
     except ImportError:
-        return None
+        logger.warning("reportlab_missing_using_simple_pdf_writer")
+        return write_simple_breach_pdf(breaches, report_dir, today)
 
     path = Path(report_dir)
     path.mkdir(parents=True, exist_ok=True)
@@ -263,6 +341,9 @@ def write_breach_pdf(breaches, report_dir, today):
     headers = ["AWB", "EDD", "Days", "Courier", "Status"]
     c.drawString(x, y, " | ".join(headers))
     y -= 6 * mm
+
+    if not breaches:
+        c.drawString(x, y, "No EDD breaches found.")
 
     for breach in breaches:
         line = " | ".join(
@@ -283,6 +364,76 @@ def write_breach_pdf(breaches, report_dir, today):
 
     c.save()
     return report_path
+
+
+def write_simple_breach_pdf(breaches, report_dir, today):
+    path = Path(report_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    report_path = path / f"shipment_edd_breaches_{today.isoformat()}.pdf"
+
+    lines = [f"Shipment EDD Breaches - {today.isoformat()}", ""]
+    if breaches:
+        lines.append("AWB | EDD | Days | Courier | Status")
+        for breach in breaches:
+            lines.append(
+                " | ".join(
+                    [
+                        str(breach.get("awb_code") or ""),
+                        str(breach.get("edd") or ""),
+                        str(breach.get("days_delayed") or ""),
+                        str(breach.get("courier_name") or "")[:24],
+                        str(breach.get("status") or "")[:18],
+                    ]
+                )
+            )
+    else:
+        lines.append("No EDD breaches found.")
+
+    content_lines = ["BT", "/F1 12 Tf", "50 790 Td"]
+    for index, line in enumerate(lines[:45]):
+        if index:
+            content_lines.append("0 -16 Td")
+        content_lines.append(f"({escape_pdf_text(line)}) Tj")
+    content_lines.append("ET")
+    content = "\n".join(content_lines).encode("latin-1", errors="replace")
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(content)).encode("ascii") + b" >>\nstream\n"
+        + content
+        + b"\nendstream",
+    ]
+
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{number} 0 obj\n".encode("ascii"))
+        pdf.extend(obj)
+        pdf.extend(b"\nendobj\n")
+
+    xref_position = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_position}\n%%EOF\n"
+        ).encode("ascii")
+    )
+
+    report_path.write_bytes(pdf)
+    return report_path
+
+
+def escape_pdf_text(text):
+    return str(text).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
 def upload_report_to_blob(*, local_path, today, prefix, access, token):

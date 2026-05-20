@@ -42,6 +42,7 @@ def check_edd_system_health():
             or (settings.shiprocket_email and settings.shiprocket_password)
         ),
         "postgres_migration_configured": bool(settings.postgres_url),
+        "blob_store_configured": bool(settings.blob_rw_token),
     }
 
     return {
