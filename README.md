@@ -4,7 +4,7 @@ Run these in PowerShell:
 Get-Process python | Stop-Process -Force
 python -m uvicorn main:app --host 127.0.0.1 --port 8000
 
-Then open:
+Then open: 
 http://127.0.0.1:8000/docs
 
 If you want it to keep running in the background:
