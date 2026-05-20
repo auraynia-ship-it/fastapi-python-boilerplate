@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/jobs/edd-breach/run",
-      "schedule": "*/5 * * * *"
+      "schedule": "30 3 * * *"
     }
   ]
 }
