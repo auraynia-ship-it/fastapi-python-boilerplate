@@ -82,7 +82,6 @@ SHIPROCKET_EMAIL=
 SHIPROCKET_PASSWORD=
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
-EDD_JOB_CRON_SECRET=
 EDD_JOB_TIMEZONE=Asia/Kolkata
 SHIPROCKET_ORDER_WINDOW_DAYS=45
 SHIPROCKET_MAX_PAGES=20
@@ -91,6 +90,7 @@ EDD_REPORT_DIR=reports
 EDD_REPORT_BLOB_PREFIX=edd-breach-reports
 EDD_REPORT_BLOB_ACCESS=public
 BLOB_READ_WRITE_TOKEN=
+LOG_LEVEL=INFO
 ```
 
 For Shiprocket auth, either provide `SHIPROCKET_TOKEN` directly or provide both
@@ -104,6 +104,22 @@ Vercel. Prefer credentials over a pasted `SHIPROCKET_TOKEN`, because Shiprocket
 tokens expire and the app can only refresh them when both credentials are
 available.
 
+The EDD breach run creates a PDF report for every completed non-dry run,
+including days with zero breaches. If `BLOB_READ_WRITE_TOKEN` is configured, the
+PDF is uploaded to Vercel Blob and the API response includes `report_blob_url`.
+Dry runs skip blob uploads.
+
+Blob uploads use Vercel Blob's HTTP API directly, so they do not depend on the
+Python Vercel SDK being installed. Redeploy after changing code or environment
+variables.
+
+Useful log lines to check in Vercel Runtime Logs after triggering the job:
+
+- `edd_breach_job_started` shows whether blob config is present.
+- `edd_breach_reports_created` shows the CSV/PDF paths created by the run.
+- `edd_breach_blob_upload_skipped` shows the exact skip reason.
+- `edd_breach_blob_upload_completed` includes the uploaded blob URL.
+
 For local testing:
 
 ```bash
@@ -111,12 +127,6 @@ curl "http://localhost:3000/api/jobs/edd-breach/run?dry_run=true"
 curl -X POST "http://localhost:3000/api/shipments/edd-breaches/run?dry_run=true"
 curl "http://localhost:3000/api/shipments/edd-breaches/health"
 curl -X POST "http://localhost:3000/api/shipments/edd-breaches/db/migrate"
-```
-
-If `EDD_JOB_CRON_SECRET` or `CRON_SECRET` is set, call the endpoint with:
-
-```bash
-Authorization: Bearer <secret>
 ```
 
 ## Demo

@@ -1,8 +1,11 @@
+import json
+import logging
 import os
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 
 from shipment_edd.config import get_edd_job_settings, load_env_file
 from shipment_edd.health import check_edd_system_health, run_edd_migration
@@ -12,6 +15,12 @@ from fastapi.responses import HTMLResponse
 
 
 load_env_file()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(
@@ -49,6 +58,13 @@ def get_serviceability_date(
     weight: float = Query(..., ge=0.5),
     cod: int = Query(..., ge=0, le=1),
 ):
+    logger.info(
+        "serviceability_request pickup_postcode=%s delivery_postcode=%s weight=%s cod=%s",
+        pickup_postcode,
+        delivery_postcode,
+        weight,
+        cod,
+    )
     try:
         response_data = get_shiprocket_client().fetch_serviceability(
             pickup_postcode=pickup_postcode,
@@ -59,6 +75,11 @@ def get_serviceability_date(
     except ShiprocketError as error:
         message = str(error)
         status_code = 503 if "SHIPROCKET_" in message else 502
+        logger.warning(
+            "serviceability_failed status_code=%s error=%s",
+            status_code,
+            message,
+        )
         raise HTTPException(status_code=status_code, detail=message) from error
 
     courier_companies = (
@@ -86,21 +107,17 @@ def get_serviceability_date(
 
 
 @app.get("/api/jobs/edd-breach/run", include_in_schema=False)
-def run_shipment_edd_breach_job(
+async def run_shipment_edd_breach_job(
     dry_run: bool = Query(False),
-    authorization: str | None = Header(default=None),
-    x_cron_secret: str | None = Header(default=None),
 ):
-    return execute_shipment_edd_breach_job(dry_run, authorization, x_cron_secret)
+    return await execute_shipment_edd_breach_job(dry_run)
 
 
 @app.post("/api/shipments/edd-breaches/run", summary="Run Shipment EDD Breach Job")
-def run_shipment_edd_breach_job_endpoint(
+async def run_shipment_edd_breach_job_endpoint(
     dry_run: bool = Query(False),
-    authorization: str | None = Header(default=None),
-    x_cron_secret: str | None = Header(default=None),
 ):
-    return execute_shipment_edd_breach_job(dry_run, authorization, x_cron_secret)
+    return await execute_shipment_edd_breach_job(dry_run)
 
 
 @app.get("/api/db/health", summary="Check Shipment EDD System Health")
@@ -109,12 +126,7 @@ def check_shipment_edd_health():
 
 
 @app.post("/api/db/migrate", summary="Run Shipment EDD DB Migration")
-def run_shipment_edd_db_migration(
-    authorization: str | None = Header(default=None),
-    x_cron_secret: str | None = Header(default=None),
-):
-    validate_job_secret(authorization, x_cron_secret)
-
+def run_shipment_edd_db_migration():
     try:
         return run_edd_migration()
     except Exception as error:
@@ -124,31 +136,29 @@ def run_shipment_edd_db_migration(
         ) from error
 
 
-def execute_shipment_edd_breach_job(
+async def execute_shipment_edd_breach_job(
     dry_run: bool,
-    authorization: str | None,
-    x_cron_secret: str | None,
 ):
-    validate_job_secret(authorization, x_cron_secret)
-
+    logger.info("edd_breach_endpoint_called dry_run=%s", dry_run)
     try:
-        return run_edd_breach_job(dry_run=dry_run)
+        result = await run_in_threadpool(run_edd_breach_job, dry_run=dry_run)
+        logger.info(
+            "edd_breach_endpoint_completed dry_run=%s breaches_found=%s report_blob_url_present=%s",
+            dry_run,
+            result.get("breaches_found"),
+            bool(result.get("report_blob_url")),
+        )
+        logger.info(
+            "edd_breach_endpoint_response=%s",
+            json.dumps(result, default=str, ensure_ascii=True),
+        )
+        return result
     except Exception as error:
+        logger.exception("edd_breach_endpoint_failed dry_run=%s", dry_run)
         raise HTTPException(
             status_code=502,
             detail=f"Shipment EDD breach job failed: {error}",
         ) from error
-
-
-def validate_job_secret(
-    authorization: str | None,
-    x_cron_secret: str | None,
-):
-    settings = get_edd_job_settings()
-    if settings.cron_secret:
-        bearer = f"Bearer {settings.cron_secret}"
-        if authorization != bearer and x_cron_secret != settings.cron_secret:
-            raise HTTPException(status_code=401, detail="Invalid cron secret.")
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
