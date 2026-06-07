@@ -78,13 +78,15 @@ class ShiprocketClient:
 
         return orders
 
-    def fetch_serviceability(self, pickup_postcode, delivery_postcode, weight, cod):
+    def fetch_serviceability(self, pickup_postcode, delivery_postcode, weight, cod, mode=None):
         params = {
             "pickup_postcode": pickup_postcode,
             "delivery_postcode": delivery_postcode,
             "weight": weight,
             "cod": cod,
         }
+        if mode:
+            params["mode"] = mode
         return self._request(f"{SHIPROCKET_SERVICEABILITY_URL}?{urlencode(params)}")
 
     def _request(
