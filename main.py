@@ -57,13 +57,22 @@ def get_serviceability_date(
     delivery_postcode: str = Query(...),
     weight: float = Query(..., ge=0.5),
     cod: int = Query(..., ge=0, le=1),
+    mode: str = Query("Surface"),
 ):
+    normalized_mode = mode.strip().capitalize()
+    if normalized_mode not in {"Surface", "Air"}:
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be either Surface or Air.",
+        )
+
     logger.info(
-        "serviceability_request pickup_postcode=%s delivery_postcode=%s weight=%s cod=%s",
+        "serviceability_request pickup_postcode=%s delivery_postcode=%s weight=%s cod=%s mode=%s",
         pickup_postcode,
         delivery_postcode,
         weight,
         cod,
+        normalized_mode,
     )
     try:
         response_data = get_shiprocket_client().fetch_serviceability(
@@ -71,6 +80,7 @@ def get_serviceability_date(
             delivery_postcode=delivery_postcode,
             weight=weight,
             cod=cod,
+            mode=normalized_mode,
         )
     except ShiprocketError as error:
         message = str(error)
