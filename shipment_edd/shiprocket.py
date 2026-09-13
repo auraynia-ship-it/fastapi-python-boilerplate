@@ -56,8 +56,9 @@ class ShiprocketClient:
         orders = []
         start_date = start_date or (date.today() - timedelta(days=45))
         end_date = end_date or date.today()
+        page = 1
 
-        for page in range(1, max_pages + 1):
+        while max_pages is None or page <= max_pages:
             params = {
                 "page": page,
                 "per_page": per_page,
@@ -75,6 +76,8 @@ class ShiprocketClient:
 
             if not page_orders or len(page_orders) < per_page:
                 break
+
+            page += 1
 
         return orders
 

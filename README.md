@@ -29,6 +29,18 @@ You can also trigger the same task manually from the API docs with:
 POST /api/shipments/edd-breaches/run
 ```
 
+To find stuck or slow-moving shipments separately from EDD breaches:
+
+```bash
+POST /api/shipments/movement-concerns/run
+```
+
+To return only AWB codes:
+
+```bash
+POST /api/shipments/movement-concerns/run?awb_only=true
+```
+
 Operational checks:
 
 ```bash
@@ -61,6 +73,15 @@ The job:
 - writes a CSV report under `reports/` locally or `/tmp/shipment_edd_reports` on Vercel
 - prints breached AWBs in the server logs
 - stores job runs, latest shipment snapshots, and daily breach rows in Supabase
+
+The movement-concerns endpoint:
+
+- fetches Shiprocket orders for the configured lookback window
+- flags open shipments that are stuck, near EDD with stale movement, breached, or carrying concerning carrier statuses
+- skips shipments with status `Out for Pickup` or `Pickup Scheduled`
+- returns `movement_concerns_found`, `movement_concerns`, and `report_csv_path`
+- returns `awb_codes` instead of full details when `awb_only=true`
+- includes AWB, severity, reason list, EDD, last movement date, days since last movement, courier, and current status for each concern
 
 Run this SQL in Supabase before enabling the cron:
 
@@ -125,6 +146,8 @@ For local testing:
 ```bash
 curl "http://localhost:3000/api/jobs/edd-breach/run?dry_run=true"
 curl -X POST "http://localhost:3000/api/shipments/edd-breaches/run?dry_run=true"
+curl -X POST "http://localhost:3000/api/shipments/movement-concerns/run?dry_run=true"
+curl -X POST "http://localhost:3000/api/shipments/movement-concerns/run?dry_run=true&awb_only=true"
 curl "http://localhost:3000/api/shipments/edd-breaches/health"
 curl -X POST "http://localhost:3000/api/shipments/edd-breaches/db/migrate"
 ```
