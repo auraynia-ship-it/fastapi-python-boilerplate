@@ -20,6 +20,44 @@ DATE_FIELDS = (
 DELIVERED_FIELDS = ("delivered_date", "delivery_date", "actual_delivery_date")
 RTO_FIELDS = ("rto_initiated_date", "rto_delivered_date", "rto_date")
 AWB_FIELDS = ("awb_code", "awb", "awb_number")
+MOVEMENT_DATE_FIELDS = (
+    "last_movement_date",
+    "last_scan_date",
+    "last_status_date",
+    "status_date",
+    "updated_at",
+    "updated_on",
+    "shipment_track_activities_date",
+    "activity_date",
+    "scan_date",
+    "event_date",
+    "pickup_date",
+    "shipped_date",
+)
+CONCERN_STATUS_TERMS = (
+    "delay",
+    "delayed",
+    "exception",
+    "hold",
+    "held",
+    "undelivered",
+    "failed",
+    "lost",
+    "damaged",
+    "misroute",
+    "misrouted",
+)
+OPEN_STATUS_TERMS = (
+    "manifest",
+    "pickup",
+    "picked",
+    "in transit",
+    "transit",
+    "shipped",
+    "out for delivery",
+)
+FINAL_STATUS_TERMS = ("delivered", "rto", "return", "cancel")
+SKIPPED_MOVEMENT_CONCERN_STATUSES = ("out for pickup", "pickup scheduled")
 logger = logging.getLogger(__name__)
 
 
@@ -199,6 +237,93 @@ def run_edd_breach_job(today=None, dry_run=False):
     }
 
 
+def run_shipment_movement_concern_job(today=None, dry_run=False, awb_only=False):
+    settings = get_edd_job_settings()
+    today = today or business_today(settings.timezone)
+    logger.info(
+        "shipment_movement_concern_job_started dry_run=%s awb_only=%s today=%s timezone=%s "
+        "order_window_days=%s shiprocket_token_present=%s "
+        "shiprocket_credentials_present=%s supabase_configured=%s report_dir=%s",
+        dry_run,
+        awb_only,
+        today.isoformat(),
+        settings.timezone,
+        settings.order_window_days,
+        bool(settings.shiprocket_token),
+        bool(settings.shiprocket_email and settings.shiprocket_password),
+        bool(settings.supabase_url and settings.supabase_key),
+        settings.report_dir,
+    )
+
+    shiprocket = ShiprocketClient(
+        token=settings.shiprocket_token,
+        email=settings.shiprocket_email,
+        password=settings.shiprocket_password,
+    )
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+
+    start_date = today - timedelta(days=settings.order_window_days)
+    orders = shiprocket.fetch_orders(
+        start_date=start_date,
+        end_date=today,
+        max_pages=settings.max_pages,
+        per_page=settings.per_page,
+    )
+    snapshots = []
+    movement_concerns = []
+
+    for order in orders:
+        for shipment in iter_shipments(order):
+            snapshot = build_snapshot(order, shipment, today)
+            if not snapshot.get("awb_code"):
+                continue
+            snapshots.append(snapshot)
+            concern = build_movement_concern(snapshot, today)
+            if concern:
+                movement_concerns.append(concern)
+
+    report_csv_path = write_movement_concern_csv(
+        movement_concerns,
+        settings.report_dir,
+        today,
+    )
+
+    if not dry_run and snapshots:
+        supabase.upsert(
+            "shipment_snapshots",
+            snapshots,
+            on_conflict="awb_code",
+            returning="minimal",
+        )
+        logger.info("shipment_movement_concern_snapshots_upserted count=%s", len(snapshots))
+    elif dry_run:
+        logger.info("shipment_movement_concern_persist_skipped reason=dry_run_enabled")
+
+    logger.info(
+        "shipment_movement_concern_job_completed orders_fetched=%s "
+        "shipments_checked=%s movement_concerns_found=%s",
+        len(orders),
+        len(snapshots),
+        len(movement_concerns),
+    )
+
+    awb_codes = [concern["awb_code"] for concern in movement_concerns]
+    response = {
+        "status": "completed",
+        "dry_run": dry_run,
+        "orders_fetched": len(orders),
+        "shipments_checked": len(snapshots),
+        "movement_concerns_found": len(movement_concerns),
+        "report_csv_path": str(report_csv_path) if report_csv_path else None,
+    }
+    if awb_only:
+        response["awb_codes"] = awb_codes
+    else:
+        response["movement_concerns"] = movement_concerns
+
+    return response
+
+
 def business_today(timezone_name):
     try:
         tzinfo = ZoneInfo(timezone_name)
@@ -287,6 +412,143 @@ def is_edd_breached(snapshot, today):
         and not snapshot.get("delivered_date")
         and not snapshot.get("rto_initiated_date")
     )
+
+
+def build_movement_concern(snapshot, today):
+    if is_shipment_closed(snapshot):
+        return None
+
+    raw_payload = snapshot.get("raw_payload") or {}
+    status = snapshot.get("status") or ""
+    status_text = normalize_status(status)
+    if status_text in SKIPPED_MOVEMENT_CONCERN_STATUSES:
+        return None
+
+    latest_movement_date = latest_payload_date(raw_payload, MOVEMENT_DATE_FIELDS)
+    days_since_movement = (
+        (today - latest_movement_date).days if latest_movement_date else None
+    )
+    edd = date.fromisoformat(snapshot["edd"]) if snapshot.get("edd") else None
+    days_until_edd = (edd - today).days if edd else None
+    reasons = []
+    severity = None
+
+    if is_edd_breached(snapshot, today):
+        reasons.append("EDD breached and shipment is still open")
+        severity = "high"
+
+    if any(term in status_text for term in CONCERN_STATUS_TERMS):
+        reasons.append(f"status is concerning: {status}")
+        severity = "high"
+
+    if days_since_movement is None:
+        if edd and days_until_edd <= 2:
+            reasons.append("no movement timestamp found near EDD")
+            severity = severity or "medium"
+    elif days_since_movement >= 5:
+        reasons.append(f"no movement for {days_since_movement} days")
+        severity = "high"
+    elif days_since_movement >= 3 and edd and days_until_edd <= 2:
+        reasons.append(
+            f"no movement for {days_since_movement} days with EDD within 2 days"
+        )
+        severity = severity or "medium"
+    elif (
+        days_since_movement >= 2
+        and edd
+        and days_until_edd is not None
+        and days_until_edd <= 1
+        and any(term in status_text for term in OPEN_STATUS_TERMS)
+    ):
+        reasons.append(
+            f"slow movement near EDD: {days_since_movement} days since last scan"
+        )
+        severity = severity or "medium"
+
+    if not reasons:
+        return None
+
+    return {
+        "awb_code": snapshot["awb_code"],
+        "severity": severity or "low",
+        "reasons": reasons,
+        "edd": snapshot.get("edd"),
+        "days_until_edd": days_until_edd,
+        "days_since_last_movement": days_since_movement,
+        "last_movement_date": latest_movement_date.isoformat()
+        if latest_movement_date
+        else None,
+        "shiprocket_order_id": snapshot.get("shiprocket_order_id"),
+        "channel_order_id": snapshot.get("channel_order_id"),
+        "shipment_id": snapshot.get("shipment_id"),
+        "courier_name": snapshot.get("courier_name"),
+        "status": snapshot.get("status"),
+    }
+
+
+def is_shipment_closed(snapshot):
+    if snapshot.get("delivered_date") or snapshot.get("rto_initiated_date"):
+        return True
+
+    status = normalize_status(snapshot.get("status"))
+    return any(term in status for term in FINAL_STATUS_TERMS)
+
+
+def normalize_status(status):
+    return " ".join(str(status or "").strip().lower().split())
+
+
+def latest_payload_date(value, matching_keys):
+    dates = []
+    collect_payload_dates(value, {key.lower() for key in matching_keys}, dates)
+    return max(dates) if dates else None
+
+
+def collect_payload_dates(value, matching_keys, dates):
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            normalized_key = str(key).lower()
+            if normalized_key in matching_keys or (
+                "date" in normalized_key
+                and any(term in normalized_key for term in ("scan", "status", "activity"))
+            ):
+                parsed_date = parse_date(nested_value)
+                if parsed_date:
+                    dates.append(parsed_date)
+            collect_payload_dates(nested_value, matching_keys, dates)
+    elif isinstance(value, list):
+        for item in value:
+            collect_payload_dates(item, matching_keys, dates)
+
+
+def write_movement_concern_csv(movement_concerns, report_dir, today):
+    path = Path(report_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    report_path = path / f"shipment_movement_concerns_{today.isoformat()}.csv"
+
+    fieldnames = [
+        "awb_code",
+        "severity",
+        "reasons",
+        "edd",
+        "days_until_edd",
+        "days_since_last_movement",
+        "last_movement_date",
+        "shiprocket_order_id",
+        "channel_order_id",
+        "shipment_id",
+        "courier_name",
+        "status",
+    ]
+    with report_path.open("w", newline="", encoding="utf-8") as report:
+        writer = csv.DictWriter(report, fieldnames=fieldnames)
+        writer.writeheader()
+        for concern in movement_concerns:
+            row = {key: concern.get(key) for key in fieldnames}
+            row["reasons"] = "; ".join(concern.get("reasons") or [])
+            writer.writerow(row)
+
+    return report_path
 
 
 def write_breach_csv(breaches, report_dir, today):

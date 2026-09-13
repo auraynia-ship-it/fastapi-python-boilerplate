@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from shipment_edd.config import get_edd_job_settings, load_env_file
 from shipment_edd.health import check_edd_system_health, run_edd_migration
-from shipment_edd.job import run_edd_breach_job
+from shipment_edd.job import run_edd_breach_job, run_shipment_movement_concern_job
 from shipment_edd.shiprocket import ShiprocketClient, ShiprocketError
 from fastapi.responses import HTMLResponse
 
@@ -49,6 +49,65 @@ def get_shiprocket_client():
         password=settings.shiprocket_password,
         timeout=20,
     )
+
+
+SHIPMENT_STATUS_BUCKETS = {
+    "rto": "RTO",
+    "delivered": "DELIVERED",
+    "in_transit": "TRANSIT",
+}
+
+
+def order_has_channel_sku(order, channel_sku):
+    if not channel_sku:
+        return True
+
+    expected_sku = channel_sku.strip().casefold()
+    products = order.get("products", [])
+    if not isinstance(products, list):
+        return False
+
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        product_sku = str(product.get("channel_sku", "")).strip().casefold()
+        if product_sku == expected_sku:
+            return True
+
+    return False
+
+
+def classify_shipment_status(status):
+    normalized_status = str(status or "").upper()
+    for bucket, keyword in SHIPMENT_STATUS_BUCKETS.items():
+        if keyword in normalized_status:
+            return bucket
+    return None
+
+
+def summarize_packets_by_status(orders, channel_sku):
+    summary = {
+        "delivered": 0,
+        "rto": 0,
+        "in_transit": 0,
+    }
+    ignored_statuses = {}
+    matched_packets = 0
+
+    for order in orders:
+        if not isinstance(order, dict) or not order_has_channel_sku(order, channel_sku):
+            continue
+
+        matched_packets += 1
+        bucket = classify_shipment_status(order.get("status"))
+        if bucket:
+            summary[bucket] += 1
+            continue
+
+        status = str(order.get("status") or "UNKNOWN")
+        ignored_statuses[status] = ignored_statuses.get(status, 0) + 1
+
+    return summary, matched_packets, ignored_statuses
 
 
 @app.get("/api/serviceability")
@@ -116,6 +175,63 @@ def get_serviceability_date(
     return {"date": (earliest_etd + timedelta(days=1)).isoformat()}
 
 
+@app.get("/api/shipments/status-summary", summary="Get Shipment Status Summary By SKU")
+async def get_shipment_status_summary(
+    from_date: date = Query(..., alias="from"),
+    to_date: date = Query(..., alias="to"),
+    channel_sku: str | None = Query(None),
+    per_page: int = Query(100, ge=1, le=100),
+):
+    if from_date > to_date:
+        raise HTTPException(
+            status_code=400,
+            detail="from date must be less than or equal to to date.",
+        )
+
+    normalized_sku = channel_sku.strip() if channel_sku else ""
+    logger.info(
+        "shipment_status_summary_request from=%s to=%s channel_sku=%s per_page=%s",
+        from_date,
+        to_date,
+        normalized_sku or "ALL",
+        per_page,
+    )
+
+    try:
+        orders = await run_in_threadpool(
+            get_shiprocket_client().fetch_orders,
+            start_date=from_date,
+            end_date=to_date,
+            max_pages=None,
+            per_page=per_page,
+        )
+    except ShiprocketError as error:
+        message = str(error)
+        status_code = 503 if "SHIPROCKET_" in message else 502
+        logger.warning(
+            "shipment_status_summary_failed status_code=%s error=%s",
+            status_code,
+            message,
+        )
+        raise HTTPException(status_code=status_code, detail=message) from error
+
+    summary, matched_packets, ignored_statuses = summarize_packets_by_status(
+        orders,
+        normalized_sku,
+    )
+    return {
+        "from": from_date.isoformat(),
+        "to": to_date.isoformat(),
+        "channel_sku": normalized_sku or None,
+        "packets": summary,
+        "matched_packets": matched_packets,
+        "ignored_packets": sum(ignored_statuses.values()),
+        "ignored_statuses": ignored_statuses,
+        "fetched_orders": len(orders),
+        "status_keywords": SHIPMENT_STATUS_BUCKETS,
+    }
+
+
 @app.get("/api/jobs/edd-breach/run", include_in_schema=False)
 async def run_shipment_edd_breach_job(
     dry_run: bool = Query(False),
@@ -128,6 +244,17 @@ async def run_shipment_edd_breach_job_endpoint(
     dry_run: bool = Query(False),
 ):
     return await execute_shipment_edd_breach_job(dry_run)
+
+
+@app.post(
+    "/api/shipments/movement-concerns/run",
+    summary="Run Shipment Movement Concern Job",
+)
+async def run_shipment_movement_concern_job_endpoint(
+    dry_run: bool = Query(False),
+    awb_only: bool = Query(False),
+):
+    return await execute_shipment_movement_concern_job(dry_run, awb_only)
 
 
 @app.get("/api/db/health", summary="Check Shipment EDD System Health")
@@ -169,6 +296,46 @@ async def execute_shipment_edd_breach_job(
             status_code=502,
             detail=f"Shipment EDD breach job failed: {error}",
         ) from error
+
+
+async def execute_shipment_movement_concern_job(
+    dry_run: bool,
+    awb_only: bool,
+):
+    logger.info(
+        "shipment_movement_concern_endpoint_called dry_run=%s awb_only=%s",
+        dry_run,
+        awb_only,
+    )
+    try:
+        result = await run_in_threadpool(
+            run_shipment_movement_concern_job,
+            dry_run=dry_run,
+            awb_only=awb_only,
+        )
+        logger.info(
+            "shipment_movement_concern_endpoint_completed dry_run=%s "
+            "awb_only=%s movement_concerns_found=%s",
+            dry_run,
+            awb_only,
+            result.get("movement_concerns_found"),
+        )
+        logger.info(
+            "shipment_movement_concern_endpoint_response=%s",
+            json.dumps(result, default=str, ensure_ascii=True),
+        )
+        return result
+    except Exception as error:
+        logger.exception(
+            "shipment_movement_concern_endpoint_failed dry_run=%s awb_only=%s",
+            dry_run,
+            awb_only,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Shipment movement concern job failed: {error}",
+        ) from error
+
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
