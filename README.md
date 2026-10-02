@@ -17,6 +17,16 @@ This example shows how to use FastAPI on Vercel with Serverless Functions using 
 
 ## Shipment EDD Breach Job
 
+### Orders With Discounts
+
+List Shiprocket orders with a discount greater than zero in a date range:
+
+```bash
+GET /api/orders/discounted?from=2026-09-01&to=2026-09-30
+```
+
+The response includes each matching order's ID, AWB, and delivery status.
+
 The app includes a daily Shiprocket EDD breach job at:
 
 ```bash
