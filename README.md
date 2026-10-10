@@ -23,16 +23,15 @@ Shopify sends `ORDERS_CREATE` deliveries to `POST /webhooks/shopify/orders-creat
 The handler validates `X-Shopify-Hmac-Sha256` against the raw request body and
 stores the complete event in `public.shopify_webhook_events`. COD purchases are
 sent to Meta at 60% of Shopify `total_price`. Recognized prepaid orders (PayU and
-Razorpay by default) are sent at 100% only after Shopify marks them paid. Pending
-prepaid orders wait for an `ORDERS_PAID` delivery at
-`POST /webhooks/shopify/orders-paid`.
+Razorpay by default) are sent at 100% as soon as Shopify creates the order,
+including when `financial_status` is still `pending`.
 
-Create Shopify subscriptions for both `ORDERS_CREATE` and `ORDERS_PAID`, pointing
-to the corresponding deployed routes. Keep the existing `ORDERS_CREATE`
-subscription. Shopify delivery IDs are deduplicated, and a Postgres order lock plus
-a stable Meta `event_id` prevents a second Purchase for an order. Failed Meta
-delivery returns HTTP 503 so Shopify retries; inspect `meta_status`, `meta_error`,
-`meta_attempts`, and `meta_response` in the database when troubleshooting.
+The existing `ORDERS_CREATE` subscription is sufficient for this behavior; an
+`ORDERS_PAID` subscription is not required. Shopify delivery IDs are deduplicated,
+and a Postgres order lock plus a stable Meta `event_id` prevents a second Purchase
+for an order. Failed Meta delivery returns HTTP 503 so Shopify retries; inspect
+`meta_status`, `meta_error`, `meta_attempts`, and `meta_response` in the database
+when troubleshooting.
 
 Configure these deployment environment variables:
 
