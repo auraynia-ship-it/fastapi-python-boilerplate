@@ -17,6 +17,40 @@ This example shows how to use FastAPI on Vercel with Serverless Functions using 
 
 ## Shipment EDD Breach Job
 
+## Shopify Orders Create Webhook
+
+Shopify sends `ORDERS_CREATE` deliveries to `POST /webhooks/shopify/orders-create`.
+The handler validates `X-Shopify-Hmac-Sha256` against the raw request body, stores
+the complete event in `public.shopify_webhook_events`, and acknowledges duplicate
+delivery IDs without inserting them again. It logs operational order metadata only.
+
+Before enabling the subscription:
+
+1. Set `SHOPIFY_CLIENT_SECRET` to the Shopify app client secret in the deployment
+   environment. This secret is distinct from the Admin API access token.
+2. Apply `db/migrations/002_shopify_webhook_events.sql` using the existing
+   `POST /api/shipments/edd-breaches/db/migrate` endpoint, or run the SQL directly
+   in the database. The application database URL must be configured.
+3. Deploy the app at a publicly reachable HTTPS URL, then create the Shopify
+   `ORDERS_CREATE` subscription pointing to
+   `https://<your-host>/api/webhooks/shopify/orders-create` on Vercel. When
+   running the app directly with Uvicorn, use
+   `https://<your-host>/webhooks/shopify/orders-create`.
+
+Requests without a valid HMAC return `401`. If the secret or durable database
+storage is unavailable, the endpoint returns an error so Shopify can retry.
+This phase does not send Meta CAPI events.
+
+### Orders With Discounts
+
+List Shiprocket orders with a discount greater than zero in a date range:
+
+```bash
+GET /api/orders/discounted?from=2026-09-01&to=2026-09-30
+```
+
+The response includes each matching order's ID, AWB, and delivery status.
+
 The app includes a daily Shiprocket EDD breach job at:
 
 ```bash

@@ -1,9 +1,12 @@
 import json
 import logging
 import os
+import base64
+import hashlib
+import hmac
 from datetime import date, datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 
@@ -110,6 +113,126 @@ def summarize_packets_by_status(orders, channel_sku):
     return summary, matched_packets, ignored_statuses
 
 
+def summarize_shopify_order_payload(payload):
+    line_items = payload.get("line_items", [])
+    if not isinstance(line_items, list):
+        line_items = []
+
+    return {
+        "order_id": payload.get("id"),
+        "order_name": payload.get("name"),
+        "order_number": payload.get("order_number"),
+        "email_present": bool(payload.get("email")),
+        "financial_status": payload.get("financial_status"),
+        "fulfillment_status": payload.get("fulfillment_status"),
+        "total_price": payload.get("total_price"),
+        "currency": payload.get("currency"),
+        "line_items_count": len(line_items),
+    }
+
+
+def verify_shopify_webhook_hmac(raw_body: bytes, hmac_header: str, secret: str) -> bool:
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    calculated = base64.b64encode(digest).decode("ascii")
+    return hmac.compare_digest(calculated, hmac_header)
+
+
+def persist_shopify_webhook_event(
+    webhook_id, topic, shop_domain, order_id, order_number, payload
+):
+    """Persist a webhook before acknowledging it; return True for first delivery."""
+    database_url = (
+        os.getenv("POSTGRES_URL_NON_POOLING")
+        or os.getenv("POSTGRES_URL")
+        or os.getenv("POSTGRES_PRISMA_URL")
+    )
+    if not database_url:
+        raise RuntimeError("Postgres connection is not configured.")
+
+    try:
+        import psycopg
+    except ImportError as error:
+        raise RuntimeError("psycopg is required for Shopify webhook persistence.") from error
+
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO public.shopify_webhook_events
+                    (webhook_id, topic, shop_domain, order_id, order_number,
+                     payload, status, received_at)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'RECEIVED', now())
+                ON CONFLICT (webhook_id) DO NOTHING
+                RETURNING webhook_id
+                """,
+                (
+                    webhook_id,
+                    topic,
+                    shop_domain,
+                    str(order_id) if order_id is not None else None,
+                    str(order_number) if order_number is not None else None,
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            inserted = cursor.fetchone() is not None
+    return inserted
+
+
+def get_order_discount(order):
+    """Read common Shiprocket/Shopify order-level discount representations."""
+    for key in ("discount", "discount_amount", "total_discount", "discount_total"):
+        value = order.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+
+    # Shopify payloads may expose discounts on line items or discount applications.
+    line_items = order.get("line_items")
+    if isinstance(line_items, list):
+        total = 0.0
+        found = False
+        for item in line_items:
+            if not isinstance(item, dict):
+                continue
+            allocations = item.get("discount_allocations")
+            if isinstance(allocations, list):
+                for allocation in allocations:
+                    if isinstance(allocation, dict):
+                        try:
+                            total += float(allocation.get("amount") or 0)
+                            found = True
+                        except (TypeError, ValueError):
+                            pass
+        if found:
+            return total
+
+    return 0.0
+
+
+def summarize_discounted_order(order):
+    shipments = []
+    for key in ("shipments", "shipment", "shipment_details", "shipments_details"):
+        value = order.get(key)
+        if isinstance(value, list):
+            shipments.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            shipments.append(value)
+
+    shipment = shipments[0] if shipments else {}
+    return {
+        "order_id": order.get("id") or order.get("order_id"),
+        "awb": next(
+            (source.get(key) for source in (shipment, order)
+             for key in ("awb_code", "awb", "awb_number") if source.get(key)),
+            None,
+        ),
+        "delivery_status": order.get("status"),
+        "discount": get_order_discount(order),
+    }
+
+
 @app.get("/api/serviceability")
 def get_serviceability_date(
     pickup_postcode: str = Query(...),
@@ -175,6 +298,81 @@ def get_serviceability_date(
     return {"date": (earliest_etd + timedelta(days=1)).isoformat()}
 
 
+@app.post("/webhooks/shopify/orders-create", summary="Receive Shopify Orders Create Webhook")
+async def receive_shopify_orders_create_webhook(request: Request):
+    secret = os.getenv("SHOPIFY_CLIENT_SECRET")
+    if not secret:
+        logger.error("shopify_webhook_rejected reason=secret_not_configured")
+        raise HTTPException(
+            status_code=503,
+            detail="Shopify webhook verification is not configured.",
+        )
+
+    raw_body = await request.body()
+    hmac_header = request.headers.get("x-shopify-hmac-sha256", "")
+    if not hmac_header or not verify_shopify_webhook_hmac(raw_body, hmac_header, secret):
+        logger.warning("shopify_webhook_rejected reason=invalid_hmac")
+        raise HTTPException(status_code=401, detail="Invalid Shopify HMAC.")
+
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.") from error
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object payload.")
+
+    topic = request.headers.get("x-shopify-topic")
+    shop_domain = request.headers.get("x-shopify-shop-domain")
+    webhook_id = request.headers.get("x-shopify-webhook-id")
+    api_version = request.headers.get("x-shopify-api-version")
+    if not webhook_id:
+        raise HTTPException(status_code=400, detail="Missing Shopify webhook delivery ID.")
+    if topic and topic.upper() != "ORDERS/CREATE":
+        raise HTTPException(status_code=400, detail="Unexpected Shopify webhook topic.")
+    order_summary = summarize_shopify_order_payload(payload)
+
+    try:
+        inserted = persist_shopify_webhook_event(
+            webhook_id=webhook_id,
+            topic=topic or "orders/create",
+            shop_domain=shop_domain,
+            order_id=payload.get("id"),
+            order_number=payload.get("order_number"),
+            payload=payload,
+        )
+    except Exception as error:
+        logger.exception("shopify_webhook_persistence_failed webhook_id=%s", webhook_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to safely store Shopify webhook.",
+        ) from error
+
+    logger.info(
+        "shopify_orders_create_webhook_received topic=%s shop_domain=%s "
+        "webhook_id=%s api_version=%s order_summary=%s",
+        topic,
+        shop_domain,
+        webhook_id,
+        api_version,
+        json.dumps(order_summary, ensure_ascii=True),
+    )
+
+    return {
+        "ok": True,
+        "message": (
+            "Shopify orders/create webhook received."
+            if inserted
+            else "Duplicate delivery acknowledged."
+        ),
+        "duplicate": not inserted,
+        "topic": topic,
+        "shop_domain": shop_domain,
+        "webhook_id": webhook_id,
+        "order": order_summary,
+    }
+
+
 @app.get("/api/shipments/status-summary", summary="Get Shipment Status Summary By SKU")
 async def get_shipment_status_summary(
     from_date: date = Query(..., alias="from"),
@@ -229,6 +427,48 @@ async def get_shipment_status_summary(
         "ignored_statuses": ignored_statuses,
         "fetched_orders": len(orders),
         "status_keywords": SHIPMENT_STATUS_BUCKETS,
+    }
+
+
+@app.get(
+    "/api/orders/discounted",
+    summary="List Orders With Positive Discounts",
+)
+async def get_discounted_orders(
+    from_date: date = Query(..., alias="from"),
+    to_date: date = Query(..., alias="to"),
+    per_page: int = Query(100, ge=1, le=100),
+):
+    if from_date > to_date:
+        raise HTTPException(
+            status_code=400,
+            detail="from date must be less than or equal to to date.",
+        )
+
+    try:
+        orders = await run_in_threadpool(
+            get_shiprocket_client().fetch_orders,
+            start_date=from_date,
+            end_date=to_date,
+            max_pages=None,
+            per_page=per_page,
+        )
+    except ShiprocketError as error:
+        message = str(error)
+        status_code = 503 if "SHIPROCKET_" in message else 502
+        logger.warning("discounted_orders_failed status_code=%s error=%s", status_code, message)
+        raise HTTPException(status_code=status_code, detail=message) from error
+
+    discounted_orders = [
+        summarize_discounted_order(order)
+        for order in orders
+        if isinstance(order, dict) and get_order_discount(order) > 0
+    ]
+    return {
+        "from": from_date.isoformat(),
+        "to": to_date.isoformat(),
+        "discounted_orders_count": len(discounted_orders),
+        "orders": discounted_orders,
     }
 
 
