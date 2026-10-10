@@ -19,6 +19,7 @@ from shopify_meta import (
     MetaDeliveryError,
     get_browser_purchase_data,
     process_shopify_webhook,
+    save_meta_attribution,
 )
 
 
@@ -52,10 +53,13 @@ app.add_middleware(
 
 @app.middleware("http")
 async def allow_shopify_pixel_opaque_origin(request: Request, call_next):
-    """Allow Shopify's opaque sandbox origin only for the token-based lookup route."""
-    lookup_path = "/api/meta/browser-purchase-lookup"
+    """Allow Shopify's opaque sandbox origin only for Meta pixel helper routes."""
+    pixel_paths = {
+        "/api/meta/browser-purchase-lookup",
+        "/api/meta/browser-attribution",
+    }
     if (
-        request.url.path != lookup_path
+        request.url.path not in pixel_paths
         or request.headers.get("origin", "").strip().lower() != "null"
     ):
         return await call_next(request)
@@ -413,6 +417,41 @@ async def receive_shopify_orders_create_webhook(request: Request):
 )
 async def receive_shopify_orders_paid_webhook(request: Request):
     return await _receive_shopify_order_webhook(request, "orders/paid")
+
+
+@app.post(
+    "/api/meta/browser-attribution",
+    summary="Save Meta Browser Attribution For A Shopify Cart",
+)
+async def save_browser_attribution(request: Request):
+    try:
+        body = await request.json()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.") from error
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+    cart_token = body.get("cart_token")
+    if not isinstance(cart_token, str) or not cart_token.strip() or len(cart_token) > 2048:
+        raise HTTPException(status_code=400, detail="Invalid cart token.")
+    fbc, fbp = body.get("fbc"), body.get("fbp")
+    if fbc is not None and not isinstance(fbc, str):
+        raise HTTPException(status_code=400, detail="Invalid fbc value.")
+    if fbp is not None and not isinstance(fbp, str):
+        raise HTTPException(status_code=400, detail="Invalid fbp value.")
+
+    try:
+        result = await run_in_threadpool(save_meta_attribution, cart_token, fbc, fbp)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        logger.exception("browser_attribution_save_failed")
+        raise HTTPException(status_code=503, detail="Attribution is temporarily unavailable.") from error
+
+    return JSONResponse(
+        content={"ok": True, **result},
+        headers={"Cache-Control": "no-store, private"},
+    )
 
 
 @app.post(
