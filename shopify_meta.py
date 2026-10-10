@@ -232,7 +232,7 @@ def _purchase_event(order, shop_domain, payment_type):
     return pixel_id, event
 
 
-def _send_to_meta(pixel_id, event):
+def _send_to_meta(pixel_id, event, test_event_code=None):
     pixel_id = pixel_id or os.getenv("META_PIXEL_ID")
     if not pixel_id:
         raise MetaDeliveryError("META_PIXEL_ID is not configured.")
@@ -241,9 +241,17 @@ def _send_to_meta(pixel_id, event):
         raise MetaDeliveryError("META_ACCESS_TOKEN is not configured.")
 
     request_body = {"data": [event]}
-    test_event_code = os.getenv("META_CAPI_TEST_EVENT_CODE")
-    if test_event_code:
-        request_body["test_event_code"] = test_event_code
+    flag_enabled = os.getenv("META_TEST_FLAG", "").strip().casefold() == "true"
+    configured_test_code = os.getenv("META_CAPI_TEST_EVENT_CODE", "").strip()
+    if flag_enabled and not configured_test_code:
+        raise MetaDeliveryError(
+            "META_TEST_FLAG is TRUE but META_CAPI_TEST_EVENT_CODE is not configured."
+        )
+    effective_test_code = test_event_code or (
+        configured_test_code if flag_enabled else None
+    )
+    if effective_test_code:
+        request_body["test_event_code"] = effective_test_code
 
     request = urllib.request.Request(
         f"https://graph.facebook.com/{META_API_VERSION}/{pixel_id}/events",
@@ -270,10 +278,13 @@ def _send_to_meta(pixel_id, event):
         "events_received": parsed.get("events_received"),
         "fbtrace_id": parsed.get("fbtrace_id"),
         "messages": parsed.get("messages", []),
+        "test_mode": bool(effective_test_code),
     }
 
 
-def process_shopify_webhook(webhook_id, topic, shop_domain, payload):
+def process_shopify_webhook(
+    webhook_id, topic, shop_domain, payload, test_event_code=None
+):
     """Persist and process one signed Shopify event with order-level locking."""
     database_url = _database_url()
     if not database_url:
@@ -428,7 +439,9 @@ def process_shopify_webhook(webhook_id, topic, shop_domain, payload):
                     (event_id, value, row_id),
                 )
                 try:
-                    meta_response = _send_to_meta(pixel_id, event)
+                    meta_response = _send_to_meta(
+                        pixel_id, event, test_event_code=test_event_code
+                    )
                 except MetaDeliveryError as error:
                     retry_error = str(error)
                     cursor.execute(
@@ -454,12 +467,14 @@ def process_shopify_webhook(webhook_id, topic, shop_domain, payload):
                         "meta_event_id": event_id,
                         "meta_value": value,
                         "meta_currency": event["custom_data"]["currency"],
+                        "meta_test_mode": meta_response.get("test_mode", False),
                     }
 
     if response_result and response_result["meta_status"] == "META_SENT":
         logger.info(
-            "meta_purchase_accepted order_id=%s webhook_id=%s event_id=%s "
+            "meta_purchase_accepted mode=%s order_id=%s webhook_id=%s event_id=%s "
             "value=%s currency=%s events_received=%s fbtrace_id=%s",
+            "TEST" if response_result["meta_test_mode"] else "PRODUCTION",
             order_id,
             webhook_id,
             response_result["meta_event_id"],

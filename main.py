@@ -290,6 +290,16 @@ async def _receive_shopify_order_webhook(request: Request, expected_topic: str):
     expected_topic_header = expected_topic.upper()
     if not topic or topic.upper() != expected_topic_header:
         raise HTTPException(status_code=400, detail="Unexpected Shopify webhook topic.")
+    test_event_code = request.headers.get("x-meta-test-event-code")
+    if test_event_code:
+        configured_test_code = os.getenv("META_CAPI_TEST_EVENT_CODE", "")
+        if not configured_test_code or not hmac.compare_digest(
+            test_event_code, configured_test_code
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Meta test event code is not enabled for this request.",
+            )
     order_summary = summarize_shopify_order_payload(payload)
 
     try:
@@ -299,6 +309,7 @@ async def _receive_shopify_order_webhook(request: Request, expected_topic: str):
             topic=topic,
             shop_domain=shop_domain,
             payload=payload,
+            test_event_code=test_event_code,
         )
     except MetaDeliveryError as error:
         logger.warning(
@@ -337,6 +348,7 @@ async def _receive_shopify_order_webhook(request: Request, expected_topic: str):
         "duplicate": result.get("duplicate", False),
         "meta_status": result["meta_status"],
         "meta_events_received": result.get("meta_events_received"),
+        "meta_test_mode": result.get("meta_test_mode", False),
         "topic": topic,
         "shop_domain": shop_domain,
         "webhook_id": webhook_id,
