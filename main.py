@@ -14,7 +14,7 @@ from shipment_edd.config import get_edd_job_settings, load_env_file
 from shipment_edd.health import check_edd_system_health, run_edd_migration
 from shipment_edd.job import run_edd_breach_job, run_shipment_movement_concern_job
 from shipment_edd.shiprocket import ShiprocketClient, ShiprocketError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from shopify_meta import (
     MetaDeliveryError,
     get_browser_purchase_data,
@@ -48,6 +48,44 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def allow_shopify_pixel_opaque_origin(request: Request, call_next):
+    """Allow Shopify's opaque sandbox origin only for the token-based lookup route."""
+    lookup_path = "/api/meta/browser-purchase-lookup"
+    if (
+        request.url.path != lookup_path
+        or request.headers.get("origin", "").strip().lower() != "null"
+    ):
+        return await call_next(request)
+
+    cors_headers = {
+        "Access-Control-Allow-Origin": "null",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "content-type",
+        "Access-Control-Max-Age": "600",
+        "Vary": "Origin",
+    }
+
+    if request.method == "OPTIONS":
+        requested_method = request.headers.get(
+            "access-control-request-method", ""
+        ).upper()
+        requested_headers = {
+            header.strip().lower()
+            for header in request.headers.get(
+                "access-control-request-headers", ""
+            ).split(",")
+            if header.strip()
+        }
+        if requested_method != "POST" or not requested_headers.issubset({"content-type"}):
+            return Response(status_code=400)
+        return Response(status_code=204, headers=cors_headers)
+
+    response = await call_next(request)
+    response.headers.update(cors_headers)
+    return response
 
 
 def get_shiprocket_client():
