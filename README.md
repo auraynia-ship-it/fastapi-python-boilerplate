@@ -17,29 +17,38 @@ This example shows how to use FastAPI on Vercel with Serverless Functions using 
 
 ## Shipment EDD Breach Job
 
-## Shopify Orders Create Webhook
+## Shopify Orders Webhooks and Meta Purchase CAPI
 
 Shopify sends `ORDERS_CREATE` deliveries to `POST /webhooks/shopify/orders-create`.
-The handler validates `X-Shopify-Hmac-Sha256` against the raw request body, stores
-the complete event in `public.shopify_webhook_events`, and acknowledges duplicate
-delivery IDs without inserting them again. It logs operational order metadata only.
+The handler validates `X-Shopify-Hmac-Sha256` against the raw request body and
+stores the complete event in `public.shopify_webhook_events`. COD purchases are
+sent to Meta at 60% of Shopify `total_price`. Recognized prepaid orders (PayU and
+Razorpay by default) are sent at 100% as soon as Shopify creates the order,
+including when `financial_status` is still `pending`.
 
-Before enabling the subscription:
+The existing `ORDERS_CREATE` subscription is sufficient for this behavior; an
+`ORDERS_PAID` subscription is not required. Shopify delivery IDs are deduplicated,
+and a Postgres order lock plus a stable Meta `event_id` prevents a second Purchase
+for an order. Failed Meta delivery returns HTTP 503 so Shopify retries; inspect
+`meta_status`, `meta_error`, `meta_attempts`, and `meta_response` in the database
+when troubleshooting.
 
-1. Set `SHOPIFY_CLIENT_SECRET` to the Shopify app client secret in the deployment
-   environment. This secret is distinct from the Admin API access token.
-2. Apply `db/migrations/002_shopify_webhook_events.sql` using the existing
-   `POST /api/shipments/edd-breaches/db/migrate` endpoint, or run the SQL directly
-   in the database. The application database URL must be configured.
-3. Deploy the app at a publicly reachable HTTPS URL, then create the Shopify
-   `ORDERS_CREATE` subscription pointing to
-   `https://<your-host>/api/webhooks/shopify/orders-create` on Vercel. When
-   running the app directly with Uvicorn, use
-   `https://<your-host>/webhooks/shopify/orders-create`.
+Configure these deployment environment variables:
 
-Requests without a valid HMAC return `401`. If the secret or durable database
-storage is unavailable, the endpoint returns an error so Shopify can retry.
-This phase does not send Meta CAPI events.
+- `SHOPIFY_CLIENT_SECRET`: Shopify app client secret for validating webhook HMAC.
+- `META_PIXEL_ID`: Meta Dataset/Pixel ID.
+- `META_ACCESS_TOKEN`: Meta Conversions API access token; never commit it.
+- `META_GRAPH_API_VERSION`: optional, defaults to `v26.0`.
+- `META_EVENT_SOURCE_URL`: optional HTTPS fallback; defaults to `https://auraynia.com/`.
+- `META_PREPAID_GATEWAYS`: optional comma-separated allowlist; defaults to `PayU,Razorpay`.
+- `META_CAPI_TEST_EVENT_CODE`: leave unset in production; when set, events go to the
+  Meta Test Events tool.
+
+Apply `db/migrations/002_shopify_webhook_events.sql` and
+`db/migrations/003_shopify_meta_capi.sql` using the existing
+`POST /api/shipments/edd-breaches/db/migrate` endpoint or run the SQL directly.
+The `send_shopify_webhook_test.py` helper marks its payload as a test order, so it
+is stored but deliberately does not generate a Meta Purchase.
 
 ### Orders With Discounts
 
