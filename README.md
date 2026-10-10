@@ -33,6 +33,23 @@ for an order. Failed Meta delivery returns HTTP 503 so Shopify retries; inspect
 `meta_status`, `meta_error`, `meta_attempts`, and `meta_response` in the database
 when troubleshooting.
 
+The customer-account pixel can retrieve the already-sent Purchase parameters with
+`POST /api/meta/browser-purchase-lookup`, sending the 32-character Shopify order
+token in a JSON body. The endpoint only returns orders whose webhook event has
+already been accepted by Meta; it returns the persisted event ID/value and the
+Purchase content fields, without customer data. The token is treated as a bearer
+secret, so the route does not log it and responses disable caching. CORS includes
+`https://account.auraynia.com` for the customer-account pixel.
+
+Example request:
+
+```json
+{"order_token":"<32-character-order-token>"}
+```
+
+The response is suitable for `fbq("track", "Purchase", parameters, {eventID})`.
+The browser and CAPI event IDs must match exactly for Meta deduplication.
+
 Configure these deployment environment variables:
 
 - `SHOPIFY_CLIENT_SECRET`: Shopify app client secret for validating webhook HMAC.
