@@ -1,6 +1,9 @@
 import json
 import logging
 import os
+import base64
+import hashlib
+import hmac
 from datetime import date, datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -128,6 +131,53 @@ def summarize_shopify_order_payload(payload):
     }
 
 
+def verify_shopify_webhook_hmac(raw_body: bytes, hmac_header: str, secret: str) -> bool:
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    calculated = base64.b64encode(digest).decode("ascii")
+    return hmac.compare_digest(calculated, hmac_header)
+
+
+def persist_shopify_webhook_event(
+    webhook_id, topic, shop_domain, order_id, order_number, payload
+):
+    """Persist a webhook before acknowledging it; return True for first delivery."""
+    database_url = (
+        os.getenv("POSTGRES_URL_NON_POOLING")
+        or os.getenv("POSTGRES_URL")
+        or os.getenv("POSTGRES_PRISMA_URL")
+    )
+    if not database_url:
+        raise RuntimeError("Postgres connection is not configured.")
+
+    try:
+        import psycopg
+    except ImportError as error:
+        raise RuntimeError("psycopg is required for Shopify webhook persistence.") from error
+
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO public.shopify_webhook_events
+                    (webhook_id, topic, shop_domain, order_id, order_number,
+                     payload, status, received_at)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'RECEIVED', now())
+                ON CONFLICT (webhook_id) DO NOTHING
+                RETURNING webhook_id
+                """,
+                (
+                    webhook_id,
+                    topic,
+                    shop_domain,
+                    str(order_id) if order_id is not None else None,
+                    str(order_number) if order_number is not None else None,
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            inserted = cursor.fetchone() is not None
+    return inserted
+
+
 def get_order_discount(order):
     """Read common Shiprocket/Shopify order-level discount representations."""
     for key in ("discount", "discount_amount", "total_discount", "discount_total"):
@@ -179,6 +229,7 @@ def summarize_discounted_order(order):
             None,
         ),
         "delivery_status": order.get("status"),
+        "discount": get_order_discount(order),
     }
 
 
@@ -249,9 +300,23 @@ def get_serviceability_date(
 
 @app.post("/webhooks/shopify/orders-create", summary="Receive Shopify Orders Create Webhook")
 async def receive_shopify_orders_create_webhook(request: Request):
+    secret = os.getenv("SHOPIFY_CLIENT_SECRET")
+    if not secret:
+        logger.error("shopify_webhook_rejected reason=secret_not_configured")
+        raise HTTPException(
+            status_code=503,
+            detail="Shopify webhook verification is not configured.",
+        )
+
+    raw_body = await request.body()
+    hmac_header = request.headers.get("x-shopify-hmac-sha256", "")
+    if not hmac_header or not verify_shopify_webhook_hmac(raw_body, hmac_header, secret):
+        logger.warning("shopify_webhook_rejected reason=invalid_hmac")
+        raise HTTPException(status_code=401, detail="Invalid Shopify HMAC.")
+
     try:
-        payload = await request.json()
-    except json.JSONDecodeError as error:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise HTTPException(status_code=400, detail="Invalid JSON payload.") from error
 
     if not isinstance(payload, dict):
@@ -261,7 +326,27 @@ async def receive_shopify_orders_create_webhook(request: Request):
     shop_domain = request.headers.get("x-shopify-shop-domain")
     webhook_id = request.headers.get("x-shopify-webhook-id")
     api_version = request.headers.get("x-shopify-api-version")
+    if not webhook_id:
+        raise HTTPException(status_code=400, detail="Missing Shopify webhook delivery ID.")
+    if topic and topic.upper() != "ORDERS/CREATE":
+        raise HTTPException(status_code=400, detail="Unexpected Shopify webhook topic.")
     order_summary = summarize_shopify_order_payload(payload)
+
+    try:
+        inserted = persist_shopify_webhook_event(
+            webhook_id=webhook_id,
+            topic=topic or "orders/create",
+            shop_domain=shop_domain,
+            order_id=payload.get("id"),
+            order_number=payload.get("order_number"),
+            payload=payload,
+        )
+    except Exception as error:
+        logger.exception("shopify_webhook_persistence_failed webhook_id=%s", webhook_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to safely store Shopify webhook.",
+        ) from error
 
     logger.info(
         "shopify_orders_create_webhook_received topic=%s shop_domain=%s "
@@ -275,7 +360,12 @@ async def receive_shopify_orders_create_webhook(request: Request):
 
     return {
         "ok": True,
-        "message": "Shopify orders/create webhook received.",
+        "message": (
+            "Shopify orders/create webhook received."
+            if inserted
+            else "Duplicate delivery acknowledged."
+        ),
+        "duplicate": not inserted,
         "topic": topic,
         "shop_domain": shop_domain,
         "webhook_id": webhook_id,
