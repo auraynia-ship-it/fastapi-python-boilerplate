@@ -39,7 +39,9 @@ token in a JSON body. The endpoint only returns orders whose webhook event has
 already been accepted by Meta; it returns the persisted event ID/value and the
 Purchase content fields, without customer data. The token is treated as a bearer
 secret, so the route does not log it and responses disable caching. CORS includes
-`https://account.auraynia.com` for the customer-account pixel.
+`https://account.auraynia.com` for the customer-account pixel. Shopify's sandbox
+can send requests with the opaque `null` origin; that origin is allowed only on
+this lookup route, not across the rest of the API.
 
 Example request:
 
