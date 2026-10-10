@@ -15,6 +15,7 @@ from shipment_edd.health import check_edd_system_health, run_edd_migration
 from shipment_edd.job import run_edd_breach_job, run_shipment_movement_concern_job
 from shipment_edd.shiprocket import ShiprocketClient, ShiprocketError
 from fastapi.responses import HTMLResponse
+from shopify_meta import MetaDeliveryError, process_shopify_webhook
 
 
 load_env_file()
@@ -137,47 +138,6 @@ def verify_shopify_webhook_hmac(raw_body: bytes, hmac_header: str, secret: str) 
     return hmac.compare_digest(calculated, hmac_header)
 
 
-def persist_shopify_webhook_event(
-    webhook_id, topic, shop_domain, order_id, order_number, payload
-):
-    """Persist a webhook before acknowledging it; return True for first delivery."""
-    database_url = (
-        os.getenv("POSTGRES_URL_NON_POOLING")
-        or os.getenv("POSTGRES_URL")
-        or os.getenv("POSTGRES_PRISMA_URL")
-    )
-    if not database_url:
-        raise RuntimeError("Postgres connection is not configured.")
-
-    try:
-        import psycopg
-    except ImportError as error:
-        raise RuntimeError("psycopg is required for Shopify webhook persistence.") from error
-
-    with psycopg.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO public.shopify_webhook_events
-                    (webhook_id, topic, shop_domain, order_id, order_number,
-                     payload, status, received_at)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'RECEIVED', now())
-                ON CONFLICT (webhook_id) DO NOTHING
-                RETURNING webhook_id
-                """,
-                (
-                    webhook_id,
-                    topic,
-                    shop_domain,
-                    str(order_id) if order_id is not None else None,
-                    str(order_number) if order_number is not None else None,
-                    json.dumps(payload, ensure_ascii=False),
-                ),
-            )
-            inserted = cursor.fetchone() is not None
-    return inserted
-
-
 def get_order_discount(order):
     """Read common Shiprocket/Shopify order-level discount representations."""
     for key in ("discount", "discount_amount", "total_discount", "discount_total"):
@@ -298,8 +258,7 @@ def get_serviceability_date(
     return {"date": (earliest_etd + timedelta(days=1)).isoformat()}
 
 
-@app.post("/webhooks/shopify/orders-create", summary="Receive Shopify Orders Create Webhook")
-async def receive_shopify_orders_create_webhook(request: Request):
+async def _receive_shopify_order_webhook(request: Request, expected_topic: str):
     secret = os.getenv("SHOPIFY_CLIENT_SECRET")
     if not secret:
         logger.error("shopify_webhook_rejected reason=secret_not_configured")
@@ -328,49 +287,77 @@ async def receive_shopify_orders_create_webhook(request: Request):
     api_version = request.headers.get("x-shopify-api-version")
     if not webhook_id:
         raise HTTPException(status_code=400, detail="Missing Shopify webhook delivery ID.")
-    if topic and topic.upper() != "ORDERS/CREATE":
+    expected_topic_header = expected_topic.upper()
+    if not topic or topic.upper() != expected_topic_header:
         raise HTTPException(status_code=400, detail="Unexpected Shopify webhook topic.")
     order_summary = summarize_shopify_order_payload(payload)
 
     try:
-        inserted = persist_shopify_webhook_event(
+        result = await run_in_threadpool(
+            process_shopify_webhook,
             webhook_id=webhook_id,
-            topic=topic or "orders/create",
+            topic=topic,
             shop_domain=shop_domain,
-            order_id=payload.get("id"),
-            order_number=payload.get("order_number"),
             payload=payload,
         )
-    except Exception as error:
-        logger.exception("shopify_webhook_persistence_failed webhook_id=%s", webhook_id)
+    except MetaDeliveryError as error:
+        logger.warning(
+            "shopify_meta_purchase_retry order_id=%s webhook_id=%s reason=%s",
+            payload.get("id"),
+            webhook_id,
+            error,
+        )
         raise HTTPException(
             status_code=503,
-            detail="Unable to safely store Shopify webhook.",
+            detail="Purchase event could not be delivered; Shopify should retry.",
+        ) from error
+    except Exception as error:
+        logger.exception(
+            "shopify_webhook_processing_failed webhook_id=%s", webhook_id
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to safely process Shopify webhook.",
         ) from error
 
     logger.info(
-        "shopify_orders_create_webhook_received topic=%s shop_domain=%s "
-        "webhook_id=%s api_version=%s order_summary=%s",
+        "shopify_order_webhook_received topic=%s shop_domain=%s "
+        "webhook_id=%s api_version=%s meta_status=%s order_summary=%s",
         topic,
         shop_domain,
         webhook_id,
         api_version,
+        result["meta_status"],
         json.dumps(order_summary, ensure_ascii=True),
     )
 
     return {
         "ok": True,
-        "message": (
-            "Shopify orders/create webhook received."
-            if inserted
-            else "Duplicate delivery acknowledged."
-        ),
-        "duplicate": not inserted,
+        "message": f"Shopify {expected_topic} webhook processed.",
+        "duplicate": result.get("duplicate", False),
+        "meta_status": result["meta_status"],
+        "meta_events_received": result.get("meta_events_received"),
         "topic": topic,
         "shop_domain": shop_domain,
         "webhook_id": webhook_id,
         "order": order_summary,
     }
+
+
+@app.post(
+    "/webhooks/shopify/orders-create",
+    summary="Receive Shopify Orders Create Webhook",
+)
+async def receive_shopify_orders_create_webhook(request: Request):
+    return await _receive_shopify_order_webhook(request, "orders/create")
+
+
+@app.post(
+    "/webhooks/shopify/orders-paid",
+    summary="Receive Shopify Orders Paid Webhook",
+)
+async def receive_shopify_orders_paid_webhook(request: Request):
+    return await _receive_shopify_order_webhook(request, "orders/paid")
 
 
 @app.get("/api/shipments/status-summary", summary="Get Shipment Status Summary By SKU")
