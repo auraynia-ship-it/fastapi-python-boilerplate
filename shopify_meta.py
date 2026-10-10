@@ -1,6 +1,7 @@
 """Reliable Shopify order ingestion and Meta Purchase delivery helpers."""
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -10,7 +11,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 logger = logging.getLogger(__name__)
@@ -105,19 +106,173 @@ def _order_user_data(order):
 
     customer_id = customer.get("id")
     if customer_id:
-        user_data["external_id"] = [_hashed(customer_id)]
+        # Meta's Events Manager marks External ID as an unhashed identifier.
+        user_data["external_id"] = [str(customer_id)]
 
+    note_attributes = {
+        str(attribute.get("name") or "").strip().casefold(): attribute.get("value")
+        for attribute in order.get("note_attributes") or []
+        if isinstance(attribute, dict)
+    }
     client_details = order.get("client_details") or {}
-    client_ip = order.get("browser_ip") or client_details.get("browser_ip")
-    user_agent = client_details.get("user_agent")
+    client_ip = (
+        order.get("browser_ip")
+        or client_details.get("browser_ip")
+        or note_attributes.get("ipv4_address")
+    )
+    user_agent = client_details.get("user_agent") or note_attributes.get("user_agent")
     if client_ip:
-        user_data["client_ip_address"] = str(client_ip)
+        try:
+            user_data["client_ip_address"] = str(ipaddress.ip_address(str(client_ip)))
+        except ValueError:
+            logger.info("meta_customer_match_field_ignored name=client_ip_address")
     if user_agent:
         user_data["client_user_agent"] = str(user_agent)
+
+    # Meta click/browser identifiers belong in user_data as fbc/fbp, not in
+    # custom_data. Prefer the storefront-captured values joined by cart token.
+    fbc = _valid_meta_cookie(order.get("_meta_fbc"), "fbc")
+    if not fbc:
+        fbc = _fbc_from_landing_url(order)
+    fbp = _valid_meta_cookie(order.get("_meta_fbp"), "fbp")
+    if fbc:
+        user_data["fbc"] = fbc
+    if fbp:
+        user_data["fbp"] = fbp
 
     if not any(key in user_data for key in ("em", "ph", "external_id")):
         raise ValueError("Order has no usable Meta customer matching identifier.")
     return user_data
+
+
+def _fbc_from_landing_url(order):
+    """Build fbc from Shopify/Fastrr's preserved landing URL when available."""
+    landing_url = None
+    for attribute in order.get("note_attributes") or []:
+        if (
+            isinstance(attribute, dict)
+            and str(attribute.get("name") or "").strip().casefold() == "landing_page_url"
+        ):
+            landing_url = attribute.get("value")
+            break
+    if not landing_url:
+        return None
+    try:
+        fbclid = parse_qs(urlsplit(str(landing_url)).query).get("fbclid", [None])[0]
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(fbclid, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,500}", fbclid):
+        return None
+
+    # The original click timestamp is not included in the Shopify order payload.
+    # Use order creation time as the closest available timestamp. A captured _fbc
+    # from the storefront attribution endpoint takes precedence above.
+    created_at = order.get("created_at") or order.get("processed_at")
+    if not created_at:
+        return None
+    try:
+        clicked_near = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if clicked_near.tzinfo is None:
+            clicked_near = clicked_near.replace(tzinfo=timezone.utc)
+        timestamp_ms = int(clicked_near.timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    fbc = f"fb.1.{timestamp_ms}.{fbclid}"
+    logger.info("meta_click_id_fallback source=landing_page_url")
+    return fbc
+
+
+def _valid_meta_cookie(value, name):
+    if not isinstance(value, str) or len(value) > 500:
+        return None
+    # Cookie format: fb.1.<timestamp_ms>.<browser/click identifier>
+    if re.fullmatch(r"fb\.1\.\d{10,16}\.[A-Za-z0-9._-]+", value):
+        return value
+    logger.info("meta_attribution_cookie_ignored name=%s reason=invalid_format", name)
+    return None
+
+
+def _cart_token_from_order(order):
+    for attribute in order.get("note_attributes") or []:
+        if not isinstance(attribute, dict):
+            continue
+        if str(attribute.get("name") or "").strip().casefold() == "shopifycarttoken":
+            value = attribute.get("value")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return order.get("cart_token")
+
+
+def _canonical_cart_token(value):
+    """Normalize Shopify cart IDs and Fastrr cart-token note attributes."""
+    if not isinstance(value, str):
+        return ""
+    token = value.strip().split("?", 1)[0].rstrip("/")
+    if "/" in token:
+        token = token.rsplit("/", 1)[-1]
+    return token.strip()
+
+
+def _cart_token_hash(value):
+    canonical = _canonical_cart_token(value)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
+
+
+def save_meta_attribution(cart_token, fbc=None, fbp=None):
+    """Store Meta click/browser IDs against a hash of Shopify's cart token."""
+    database_url = _database_url()
+    if not database_url:
+        raise RuntimeError("Postgres connection is not configured.")
+    cart_hash = _cart_token_hash(cart_token)
+    fbc = _valid_meta_cookie(fbc, "fbc")
+    fbp = _valid_meta_cookie(fbp, "fbp")
+    if not cart_hash or not (fbc or fbp):
+        raise ValueError("A cart token and valid Meta browser identifier are required.")
+    import psycopg
+
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO public.shopify_meta_attribution
+                    (cart_token_hash, fbc, fbp, updated_at, expires_at)
+                VALUES (%s, %s, %s, now(), now() + interval '90 days')
+                ON CONFLICT (cart_token_hash) DO UPDATE SET
+                    fbc = COALESCE(EXCLUDED.fbc, shopify_meta_attribution.fbc),
+                    fbp = COALESCE(EXCLUDED.fbp, shopify_meta_attribution.fbp),
+                    updated_at = now(),
+                    expires_at = now() + interval '90 days'
+                """,
+                (cart_hash, fbc, fbp),
+            )
+    return {"stored_fbc": bool(fbc), "stored_fbp": bool(fbp)}
+
+
+def _attach_meta_attribution(cursor, order):
+    cart_token = _cart_token_from_order(order)
+    cart_hash = _cart_token_hash(cart_token)
+    if not cart_hash:
+        logger.info("meta_attribution_lookup result=no_cart_token")
+        return
+    cursor.execute("SELECT to_regclass('public.shopify_meta_attribution')")
+    if cursor.fetchone()[0] is None:
+        logger.info("meta_attribution_lookup result=table_not_installed")
+        return
+    cursor.execute(
+        """SELECT fbc, fbp FROM public.shopify_meta_attribution
+           WHERE cart_token_hash = %s AND expires_at > now()""",
+        (cart_hash,),
+    )
+    row = cursor.fetchone()
+    if row:
+        order["_meta_fbc"], order["_meta_fbp"] = row
+        logger.info(
+            "meta_attribution_lookup result=matched fbc_present=%s fbp_present=%s",
+            bool(row[0]),
+            bool(row[1]),
+        )
+    else:
+        logger.info("meta_attribution_lookup result=no_match")
 
 
 def _source_url(order):
@@ -222,6 +377,32 @@ def _purchase_custom_data(order, payment_type):
     return custom_data
 
 
+def _browser_advanced_matching_data(order):
+    """Return raw values for Meta Pixel advanced matching on the order page."""
+    customer = order.get("customer") or {}
+    address = _order_address(order)
+    country = str(address.get("country_code") or "").strip().upper()
+    if len(country) != 2:
+        country = ""
+
+    values = {
+        "em": order.get("email") or order.get("contact_email") or customer.get("email"),
+        "ph": order.get("phone") or address.get("phone") or customer.get("phone"),
+        "fn": address.get("first_name") or customer.get("first_name"),
+        "ln": address.get("last_name") or customer.get("last_name"),
+        "ct": address.get("city"),
+        "st": address.get("province_code") or address.get("province"),
+        "zp": address.get("zip"),
+        "country": country,
+        "external_id": customer.get("id"),
+    }
+    return {
+        key: str(value).strip()
+        for key, value in values.items()
+        if value is not None and str(value).strip()
+    }
+
+
 def _purchase_event(order, shop_domain, payment_type):
     pixel_id = os.getenv("META_PIXEL_ID")
 
@@ -263,6 +444,13 @@ def get_browser_purchase_data(order_token):
                 (order_token,),
             )
             rows = cursor.fetchall()
+            if rows:
+                order_payload = rows[0][2]
+                if isinstance(order_payload, str):
+                    order_payload = json.loads(order_payload)
+                if isinstance(order_payload, dict):
+                    _attach_meta_attribution(cursor, order_payload)
+                    rows[0] = (*rows[0][:2], order_payload, *rows[0][3:])
 
     if not rows:
         return None
@@ -286,9 +474,14 @@ def get_browser_purchase_data(order_token):
     # The persisted successful CAPI value is authoritative for browser deduplication.
     custom_data["value"] = float(stored_value)
     custom_data["order_id"] = str(order_id)
+    fbc = _valid_meta_cookie(order.get("_meta_fbc"), "fbc") or _fbc_from_landing_url(order)
+    fbp = _valid_meta_cookie(order.get("_meta_fbp"), "fbp")
     return {
         "event_id": stored_event_id,
         **custom_data,
+        "advanced_matching": _browser_advanced_matching_data(order),
+        "fbc": fbc,
+        "fbp": fbp,
     }
 
 
@@ -454,6 +647,9 @@ def process_shopify_webhook(
                 raise ValueError("Unsupported Shopify topic for Purchase processing.")
 
             try:
+                # Match the attribution captured by the storefront pixel before
+                # sending CAPI. Never log or persist the raw cart token in this map.
+                _attach_meta_attribution(cursor, payload)
                 pixel_id, event = _purchase_event(payload, shop_domain, payment_type)
             except LookupError as error:
                 cursor.execute(
