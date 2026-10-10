@@ -14,8 +14,12 @@ from shipment_edd.config import get_edd_job_settings, load_env_file
 from shipment_edd.health import check_edd_system_health, run_edd_migration
 from shipment_edd.job import run_edd_breach_job, run_shipment_movement_concern_job
 from shipment_edd.shiprocket import ShiprocketClient, ShiprocketError
-from fastapi.responses import HTMLResponse
-from shopify_meta import MetaDeliveryError, process_shopify_webhook
+from fastapi.responses import HTMLResponse, JSONResponse
+from shopify_meta import (
+    MetaDeliveryError,
+    get_browser_purchase_data,
+    process_shopify_webhook,
+)
 
 
 load_env_file()
@@ -38,6 +42,7 @@ app.add_middleware(
     allow_origins=[
         "https://auraynia.com",
         "https://www.auraynia.com",
+        "https://account.auraynia.com",
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
@@ -370,6 +375,52 @@ async def receive_shopify_orders_create_webhook(request: Request):
 )
 async def receive_shopify_orders_paid_webhook(request: Request):
     return await _receive_shopify_order_webhook(request, "orders/paid")
+
+
+@app.post(
+    "/api/meta/browser-purchase-lookup",
+    summary="Look Up Purchase Data For The Customer Account Pixel",
+)
+async def lookup_browser_purchase(request: Request):
+    try:
+        body = await request.json()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.") from error
+
+    order_token = body.get("order_token") if isinstance(body, dict) else None
+    if (
+        not isinstance(order_token, str)
+        or len(order_token) != 32
+        or any(character not in "0123456789abcdefABCDEF" for character in order_token)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid order token.")
+
+    try:
+        purchase_data = await run_in_threadpool(
+            get_browser_purchase_data,
+            order_token,
+        )
+    except ValueError as error:
+        logger.error("browser_purchase_lookup_invalid_record reason=%s", error)
+        raise HTTPException(
+            status_code=503,
+            detail="Purchase data is temporarily unavailable.",
+        ) from error
+    except Exception as error:
+        logger.exception("browser_purchase_lookup_failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Purchase data is temporarily unavailable.",
+        ) from error
+
+    if purchase_data is None:
+        # Do not reveal whether a token exists for an order that wasn't delivered to Meta.
+        raise HTTPException(status_code=404, detail="Purchase data not found.")
+
+    return JSONResponse(
+        content=purchase_data,
+        headers={"Cache-Control": "no-store, private"},
+    )
 
 
 @app.get("/api/shipments/status-summary", summary="Get Shipment Status Summary By SKU")

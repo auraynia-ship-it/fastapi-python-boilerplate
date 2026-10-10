@@ -184,10 +184,8 @@ def _purchase_value(order, payment_type):
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-def _purchase_event(order, shop_domain, payment_type):
-    pixel_id = os.getenv("META_PIXEL_ID")
-
-    event_id = f"{shop_domain or 'shop'}:{order.get('id')}:Purchase"
+def _purchase_custom_data(order, payment_type):
+    """Build the Purchase custom parameters shared by CAPI and browser lookup."""
     currency = str(order.get("currency") or "").upper()
     if not currency:
         raise ValueError("Order currency is missing.")
@@ -208,6 +206,26 @@ def _purchase_event(order, shop_domain, payment_type):
         if content["id"]:
             contents.append(content)
 
+    custom_data = {
+        "value": float(_purchase_value(order, payment_type)),
+        "currency": currency,
+        "order_id": str(order.get("id")),
+        "content_type": "product",
+        "num_items": sum(
+            int(item.get("quantity") or 0)
+            for item in line_items if isinstance(item, dict)
+        ),
+    }
+    if contents:
+        custom_data["contents"] = contents
+        custom_data["content_ids"] = [item["id"] for item in contents]
+    return custom_data
+
+
+def _purchase_event(order, shop_domain, payment_type):
+    pixel_id = os.getenv("META_PIXEL_ID")
+
+    event_id = f"{shop_domain or 'shop'}:{order.get('id')}:Purchase"
     event = {
         "event_name": "Purchase",
         "event_time": _event_time(order),
@@ -215,21 +233,63 @@ def _purchase_event(order, shop_domain, payment_type):
         "action_source": "website",
         "event_source_url": _source_url(order),
         "user_data": _order_user_data(order),
-        "custom_data": {
-            "value": float(_purchase_value(order, payment_type)),
-            "currency": currency,
-            "order_id": str(order.get("id")),
-            "content_type": "product",
-            "num_items": sum(
-                int(item.get("quantity") or 0)
-                for item in line_items if isinstance(item, dict)
-            ),
-        },
+        "custom_data": _purchase_custom_data(order, payment_type),
     }
-    if contents:
-        event["custom_data"]["contents"] = contents
-        event["custom_data"]["content_ids"] = [item["id"] for item in contents]
     return pixel_id, event
+
+
+def get_browser_purchase_data(order_token):
+    """Return the minimum Purchase fields for a matching customer-account page."""
+    database_url = _database_url()
+    if not database_url:
+        raise RuntimeError("Postgres connection is not configured.")
+    try:
+        import psycopg
+    except ImportError as error:
+        raise RuntimeError("psycopg is required for webhook persistence.") from error
+
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT shop_domain, order_id, payload, meta_event_id, meta_value
+                FROM public.shopify_webhook_events
+                WHERE payload->>'token' = %s
+                  AND meta_status = 'META_SENT'
+                  AND status = 'PROCESSED'
+                ORDER BY meta_sent_at DESC NULLS LAST
+                LIMIT 2
+                """,
+                (order_token,),
+            )
+            rows = cursor.fetchall()
+
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise ValueError("Order token matched multiple processed orders.")
+
+    shop_domain, order_id, order, stored_event_id, stored_value = rows[0]
+    if isinstance(order, str):
+        order = json.loads(order)
+    if not isinstance(order, dict) or not stored_event_id or stored_value is None:
+        return None
+
+    payment_type = _classify_payment(order)
+    if payment_type is None:
+        return None
+    custom_data = _purchase_custom_data(order, payment_type)
+    expected_event_id = f"{shop_domain or 'shop'}:{order_id}:Purchase"
+    if stored_event_id != expected_event_id:
+        raise ValueError("Stored Meta event ID does not match the order record.")
+
+    # The persisted successful CAPI value is authoritative for browser deduplication.
+    custom_data["value"] = float(stored_value)
+    custom_data["order_id"] = str(order_id)
+    return {
+        "event_id": stored_event_id,
+        **custom_data,
+    }
 
 
 def _send_to_meta(pixel_id, event, test_event_code=None):
