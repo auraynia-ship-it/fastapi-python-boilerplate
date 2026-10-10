@@ -41,14 +41,21 @@ Configure these deployment environment variables:
 - `META_GRAPH_API_VERSION`: optional, defaults to `v26.0`.
 - `META_EVENT_SOURCE_URL`: optional HTTPS fallback; defaults to `https://auraynia.com/`.
 - `META_PREPAID_GATEWAYS`: optional comma-separated allowlist; defaults to `PayU,Razorpay`.
-- `META_CAPI_TEST_EVENT_CODE`: leave unset in production; when set, events go to the
-  Meta Test Events tool.
+- `META_TEST_FLAG`: set to `TRUE` to route all Meta CAPI events to Test Events.
+- `META_CAPI_TEST_EVENT_CODE`: Meta's test event code. Required when
+  `META_TEST_FLAG=TRUE`; it can also authorize one-off signed requests that carry
+  the matching `X-Meta-Test-Event-Code` header.
 
 Apply `db/migrations/002_shopify_webhook_events.sql` and
 `db/migrations/003_shopify_meta_capi.sql` using the existing
 `POST /api/shipments/edd-breaches/db/migrate` endpoint or run the SQL directly.
 The `send_shopify_webhook_test.py` helper marks its payload as a test order, so it
-is stored but deliberately does not generate a Meta Purchase.
+is stored but deliberately does not generate a Meta Purchase. To send all events to
+Meta Test Events, set `META_TEST_FLAG=TRUE` and `META_CAPI_TEST_EVENT_CODE` in the
+deployment environment. To send one synthetic Purchase instead, keep the flag off,
+set the test code in Vercel and locally, then run
+`python .\send_shopify_webhook_test.py --meta-test`. This test uses a unique
+synthetic order ID.
 
 ### Orders With Discounts
 
