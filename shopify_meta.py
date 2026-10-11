@@ -218,6 +218,13 @@ def _cart_token_hash(value):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
 
 
+def _order_attribution_hash(shop_domain, order_id):
+    if order_id is None:
+        return ""
+    key = f"order:{str(shop_domain or '').strip().lower()}:{str(order_id).strip()}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
 def save_meta_attribution(cart_token, fbc=None, fbp=None):
     """Store Meta click/browser IDs against a hash of Shopify's cart token."""
     database_url = _database_url()
@@ -235,44 +242,111 @@ def save_meta_attribution(cart_token, fbc=None, fbp=None):
             cursor.execute(
                 """
                 INSERT INTO public.shopify_meta_attribution
-                    (cart_token_hash, fbc, fbp, updated_at, expires_at)
-                VALUES (%s, %s, %s, now(), now() + interval '90 days')
-                ON CONFLICT (cart_token_hash) DO UPDATE SET
+                    (attribution_key_hash, key_type, fbc, fbp, updated_at, expires_at)
+                VALUES (%s, %s, %s, %s, now(), now() + interval '90 days')
+                ON CONFLICT (attribution_key_hash) DO UPDATE SET
                     fbc = COALESCE(EXCLUDED.fbc, shopify_meta_attribution.fbc),
                     fbp = COALESCE(EXCLUDED.fbp, shopify_meta_attribution.fbp),
                     updated_at = now(),
                     expires_at = now() + interval '90 days'
                 """,
-                (cart_hash, fbc, fbp),
+                (cart_hash, "cart", fbc, fbp),
             )
     return {"stored_fbc": bool(fbc), "stored_fbp": bool(fbp)}
 
 
-def _attach_meta_attribution(cursor, order):
+def _attach_meta_attribution(cursor, order, shop_domain=None):
     cart_token = _cart_token_from_order(order)
     cart_hash = _cart_token_hash(cart_token)
-    if not cart_hash:
-        logger.info("meta_attribution_lookup result=no_cart_token")
+    cursor.execute(
+        """SELECT to_regclass('public.shopify_meta_attribution') IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'shopify_meta_attribution'
+                      AND column_name = 'attribution_key_hash'
+                  )"""
+    )
+    if not cursor.fetchone()[0]:
+        logger.info("meta_attribution_lookup result=table_schema_not_ready")
         return
-    cursor.execute("SELECT to_regclass('public.shopify_meta_attribution')")
-    if cursor.fetchone()[0] is None:
-        logger.info("meta_attribution_lookup result=table_not_installed")
+    if cart_hash:
+        cursor.execute(
+            """SELECT fbc, fbp FROM public.shopify_meta_attribution
+               WHERE attribution_key_hash = %s AND key_type = 'cart'
+                 AND expires_at > now()""",
+            (cart_hash,),
+        )
+        row = cursor.fetchone()
+        if row:
+            order["_meta_fbc"], order["_meta_fbp"] = row
+            logger.info(
+                "meta_attribution_lookup result=cart_match fbc_present=%s fbp_present=%s",
+                bool(row[0]), bool(row[1]),
+            )
+            return
+
+    order_id = order.get("id")
+    if order_id is None:
+        logger.info("meta_attribution_lookup result=no_order_key")
         return
     cursor.execute(
         """SELECT fbc, fbp FROM public.shopify_meta_attribution
-           WHERE cart_token_hash = %s AND expires_at > now()""",
-        (cart_hash,),
+           WHERE shop_domain IS NOT DISTINCT FROM %s AND order_id = %s
+             AND key_type = 'order' AND expires_at > now()
+           ORDER BY updated_at DESC LIMIT 1""",
+        (shop_domain, str(order_id)),
     )
     row = cursor.fetchone()
     if row:
         order["_meta_fbc"], order["_meta_fbp"] = row
         logger.info(
-            "meta_attribution_lookup result=matched fbc_present=%s fbp_present=%s",
+            "meta_attribution_lookup result=order_match fbc_present=%s fbp_present=%s",
             bool(row[0]),
             bool(row[1]),
         )
     else:
-        logger.info("meta_attribution_lookup result=no_match")
+        logger.info("meta_attribution_lookup result=no_match cart_token_present=%s", bool(cart_hash))
+
+
+def _persist_order_meta_attribution(cursor, order, shop_domain=None):
+    """Save click/browser IDs from this order under its stable order key."""
+    cursor.execute(
+        """SELECT to_regclass('public.shopify_meta_attribution') IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'shopify_meta_attribution'
+                      AND column_name = 'attribution_key_hash'
+                  )"""
+    )
+    if not cursor.fetchone()[0]:
+        return
+    order_id = order.get("id")
+    key_hash = _order_attribution_hash(shop_domain, order_id)
+    if not key_hash:
+        return
+    fbc = _valid_meta_cookie(order.get("_meta_fbc"), "fbc")
+    if not fbc:
+        fbc = _fbc_from_landing_url(order)
+    fbp = _valid_meta_cookie(order.get("_meta_fbp"), "fbp")
+    if not (fbc or fbp):
+        return
+    cursor.execute(
+        """INSERT INTO public.shopify_meta_attribution
+               (attribution_key_hash, key_type, shop_domain, order_id,
+                fbc, fbp, updated_at, expires_at)
+           VALUES (%s, 'order', %s, %s, %s, %s, now(), now() + interval '90 days')
+           ON CONFLICT (attribution_key_hash) DO UPDATE SET
+               fbc = COALESCE(EXCLUDED.fbc, shopify_meta_attribution.fbc),
+               fbp = COALESCE(EXCLUDED.fbp, shopify_meta_attribution.fbp),
+               updated_at = now(), expires_at = now() + interval '90 days'""",
+        (key_hash, shop_domain, str(order_id), fbc, fbp),
+    )
+    logger.info(
+        "meta_attribution_saved key_type=order fbc_present=%s fbp_present=%s",
+        bool(fbc), bool(fbp),
+    )
 
 
 def _source_url(order):
@@ -449,7 +523,8 @@ def get_browser_purchase_data(order_token):
                 if isinstance(order_payload, str):
                     order_payload = json.loads(order_payload)
                 if isinstance(order_payload, dict):
-                    _attach_meta_attribution(cursor, order_payload)
+                    _attach_meta_attribution(cursor, order_payload, rows[0][0])
+                    _persist_order_meta_attribution(cursor, order_payload, rows[0][0])
                     rows[0] = (*rows[0][:2], order_payload, *rows[0][3:])
 
     if not rows:
@@ -583,6 +658,12 @@ def process_shopify_webhook(
             )
             row_id, meta_status = cursor.fetchone()
 
+            # Save order-level click IDs even for a Shopify redelivery of an
+            # already processed order. This must never trigger a second CAPI event.
+            if payload.get("test") is not True:
+                _attach_meta_attribution(cursor, payload, shop_domain)
+                _persist_order_meta_attribution(cursor, payload, shop_domain)
+
             if meta_status in {
                 "META_SENT", "SKIPPED_TEST", "SKIPPED_PAYMENT",
                 "SKIPPED_CANCELLED", "SKIPPED_STALE", "SKIPPED_INVALID",
@@ -647,9 +728,6 @@ def process_shopify_webhook(
                 raise ValueError("Unsupported Shopify topic for Purchase processing.")
 
             try:
-                # Match the attribution captured by the storefront pixel before
-                # sending CAPI. Never log or persist the raw cart token in this map.
-                _attach_meta_attribution(cursor, payload)
                 pixel_id, event = _purchase_event(payload, shop_domain, payment_type)
             except LookupError as error:
                 cursor.execute(
