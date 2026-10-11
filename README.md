@@ -49,17 +49,15 @@ The storefront pixel can save Meta browser attribution before checkout using
 `POST /api/meta/browser-attribution` with `cart_token`, plus `_fbc` and `_fbp`
 cookie values when available. A URL `fbclid` can be converted to Meta's `fbc`
 format (`fb.1.<timestamp_ms>.<fbclid>`) when `_fbc` is not yet present. The API
-stores only a SHA-256 hash of the Shopify cart token and expires attribution
-after 90 days. When the order webhook arrives, it matches that hash against the
-Fastrr `shopifyCartToken` order note attribute (or Shopify `cart_token`) and adds
-`fbc`/`fbp` to CAPI `user_data`. The Shopify cart ID and Fastrr note attribute
-must resolve to the same token; confirm this on a test order before relying on
-the match. If the order's `landing_page_url` note attribute includes `fbclid`,
-the webhook also builds `fbc` from that click ID when no captured `_fbc` is
-available. Since the order payload has no original click timestamp, that
-fallback uses the order creation time as an approximation. Raw click/browser
-identifiers are never written to application logs. IP address and user agent
-also fall back to Fastrr's `ipv4_address` and `user_agent` note attributes.
+stores a SHA-256 hash of the Shopify cart token and expires attribution after
+90 days. The order webhook matches that hash against the Fastrr
+`shopifyCartToken` note attribute (or Shopify `cart_token`). When those are
+missing but the signed order payload has a `fbclid` in `landing_page_url`, the
+webhook derives `fbc` and stores it under a hash of the order key instead. Since
+the order payload has no original click timestamp, this fallback uses order
+creation time as an approximation. Raw click/browser identifiers are never
+written to application logs. IP address and user agent also fall back to
+Fastrr's `ipv4_address` and `user_agent` note attributes.
 
 Example request:
 
@@ -85,7 +83,8 @@ Configure these deployment environment variables:
 
 Apply `db/migrations/002_shopify_webhook_events.sql`,
 `db/migrations/003_shopify_meta_capi.sql`, and
-`db/migrations/004_shopify_meta_attribution.sql` using the existing
+`db/migrations/004_shopify_meta_attribution.sql`, and
+`db/migrations/005_shopify_meta_attribution_order_key.sql` using the existing
 `POST /api/shipments/edd-breaches/db/migrate` endpoint or run the SQL directly.
 The `send_shopify_webhook_test.py` helper marks its payload as a test order, so it
 is stored but deliberately does not generate a Meta Purchase. To send all events to
