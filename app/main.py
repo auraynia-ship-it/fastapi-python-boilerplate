@@ -193,11 +193,14 @@ def verify_shopify_webhook_hmac(raw_body: bytes, hmac_header: str, secret: str) 
 
 def get_order_discount(order):
     """Read common Shiprocket/Shopify order-level discount representations."""
+    others = order.get("others") if isinstance(order.get("others"), dict) else {}
     for key in ("discount", "discount_amount", "total_discount", "discount_total"):
         value = order.get(key)
         if value not in (None, ""):
             try:
-                return float(value)
+                amount = float(value)
+                if amount > 0:
+                    return amount
             except (TypeError, ValueError):
                 continue
 
@@ -219,7 +222,37 @@ def get_order_discount(order):
                         except (TypeError, ValueError):
                             pass
         if found:
-            return total
+            if total > 0:
+                return total
+
+    products = order.get("products")
+    if isinstance(products, list):
+        total = 0.0
+        found = False
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            value = product.get("discount_including_tax")
+            if value in (None, ""):
+                value = product.get("discount")
+            amount = parse_order_amount(value)
+            if amount is not None and amount > 0:
+                total += amount
+                found = True
+        if found:
+            return round(total, 2)
+
+    discount_codes = others.get("discount_codes")
+    if isinstance(discount_codes, list):
+        total = sum(
+            amount
+            for code in discount_codes
+            if isinstance(code, dict)
+            if (amount := parse_order_amount(code.get("amount"))) is not None
+            and amount > 0
+        )
+        if total > 0:
+            return round(total, 2)
 
     return 0.0
 
@@ -243,7 +276,80 @@ def summarize_discounted_order(order):
         ),
         "delivery_status": order.get("status"),
         "discount": get_order_discount(order),
+        "partial_cod_collected": get_partial_cod_collected(order),
+        "shipping_amount": get_order_shipping_amount(order, shipments),
     }
+
+
+def get_partial_cod_collected(order):
+    others = order.get("others") if isinstance(order.get("others"), dict) else {}
+    value = order.get("partial_cod_collected")
+    if value in (None, ""):
+        value = others.get("partial_cod_collected")
+    return parse_order_amount(value)
+
+
+def get_order_shipping_amount(order, shipments):
+    others = order.get("others") if isinstance(order.get("others"), dict) else {}
+    for source in (order, others, *shipments):
+        for key in (
+            "shipping_amount",
+            "shipping_charges",
+            "shipping_charge",
+            "shipping_cost",
+            "shipping_price",
+        ):
+            amount = parse_order_amount(source.get(key))
+            if amount is not None:
+                return amount
+
+    shipping_lines = order.get("shipping_lines") or others.get("shipping_lines")
+    if isinstance(shipping_lines, list) and shipping_lines:
+        total = 0.0
+        found = False
+        for line in shipping_lines:
+            if not isinstance(line, dict):
+                continue
+            price_set = line.get("discounted_price_set") or line.get("price_set") or {}
+            shop_money = price_set.get("shop_money", {}) if isinstance(price_set, dict) else {}
+            value = (
+                shop_money.get("amount")
+                if isinstance(shop_money, dict)
+                else None
+            )
+            if value in (None, ""):
+                value = line.get("discounted_price", line.get("price"))
+            amount = parse_order_amount(value)
+            if amount is not None:
+                total += amount
+                found = True
+        if found:
+            return round(total, 2)
+
+    # Shiprocket's order payload may omit the shipping line amount. In that
+    # case derive it from the order total and net subtotal, accounting for tax
+    # only when the order total does not already include it.
+    total_amount = parse_order_amount(order.get("total") or order.get("total_price"))
+    subtotal_amount = parse_order_amount(
+        others.get("subtotal_price") or order.get("subtotal_price")
+    )
+    if total_amount is None or subtotal_amount is None:
+        return None
+
+    shipping_amount = total_amount - subtotal_amount
+    if others.get("taxes_included", order.get("taxes_included")) is False:
+        tax_amount = parse_order_amount(order.get("tax") or others.get("total_tax")) or 0
+        shipping_amount -= tax_amount
+    return round(shipping_amount, 2)
+
+
+def parse_order_amount(value):
+    if value in (None, ""):
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
 
 
 @app.get("/api/serviceability")
@@ -508,6 +614,7 @@ async def lookup_browser_purchase(request: Request):
 
 @app.get("/api/shipments/status-summary", summary="Get Shipment Status Summary By SKU")
 async def get_shipment_status_summary(
+    background_tasks: BackgroundTasks,
     from_date: date = Query(..., alias="from"),
     to_date: date = Query(..., alias="to"),
     channel_sku: str | None = Query(None),
@@ -528,39 +635,121 @@ async def get_shipment_status_summary(
         per_page,
     )
 
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is required to track background jobs")
+
+    job_id = str(uuid4())
     try:
-        orders = await run_in_threadpool(
-            get_shiprocket_client().fetch_orders,
-            start_date=from_date,
-            end_date=to_date,
+        supabase.insert("shipment_status_summary_job_runs", {
+            "id": job_id,
+            "status": "queued",
+            "from_date": from_date.isoformat(),
+            "to_date": to_date.isoformat(),
+            "channel_sku": normalized_sku or None,
+            "per_page": per_page,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as error:
+        logger.exception("shipment_status_summary_queue_failed")
+        raise HTTPException(status_code=502, detail=f"Unable to queue status summary job: {error}") from error
+
+    background_tasks.add_task(
+        run_shipment_status_summary_in_background,
+        job_id,
+        from_date.isoformat(),
+        to_date.isoformat(),
+        normalized_sku,
+        per_page,
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job_id,
+            "status": "queued",
+            "status_url": f"/api/shipments/status-summary/runs/{job_id}",
+        },
+    )
+
+
+@app.get(
+    "/api/shipments/status-summary/runs/{job_id}",
+    summary="Get Shipment Status Summary Job Status",
+)
+def get_shipment_status_summary_job_status(job_id: str):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+    try:
+        rows = supabase.get("shipment_status_summary_job_runs", {"id": f"eq.{job_id}"})
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Unable to read job status: {error}") from error
+    if not rows:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return rows[0]
+
+
+def run_shipment_status_summary_in_background(
+    job_id: str,
+    from_date_value: str,
+    to_date_value: str,
+    channel_sku: str,
+    per_page: int,
+):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    try:
+        supabase.update(
+            "shipment_status_summary_job_runs",
+            {"id": f"eq.{job_id}"},
+            {"status": "running"},
+        )
+        orders = get_shiprocket_client().fetch_orders(
+            start_date=date.fromisoformat(from_date_value),
+            end_date=date.fromisoformat(to_date_value),
             max_pages=None,
             per_page=per_page,
         )
-    except ShiprocketError as error:
-        message = str(error)
-        status_code = 503 if "SHIPROCKET_" in message else 502
-        logger.warning(
-            "shipment_status_summary_failed status_code=%s error=%s",
-            status_code,
-            message,
+        summary, matched_packets, ignored_statuses = summarize_packets_by_status(
+            orders, channel_sku
         )
-        raise HTTPException(status_code=status_code, detail=message) from error
-
-    summary, matched_packets, ignored_statuses = summarize_packets_by_status(
-        orders,
-        normalized_sku,
-    )
-    return {
-        "from": from_date.isoformat(),
-        "to": to_date.isoformat(),
-        "channel_sku": normalized_sku or None,
-        "packets": summary,
-        "matched_packets": matched_packets,
-        "ignored_packets": sum(ignored_statuses.values()),
-        "ignored_statuses": ignored_statuses,
-        "fetched_orders": len(orders),
-        "status_keywords": SHIPMENT_STATUS_BUCKETS,
-    }
+        result = {
+            "from": from_date_value,
+            "to": to_date_value,
+            "channel_sku": channel_sku or None,
+            "packets": summary,
+            "matched_packets": matched_packets,
+            "ignored_packets": sum(ignored_statuses.values()),
+            "ignored_statuses": ignored_statuses,
+            "fetched_orders": len(orders),
+            "status_keywords": SHIPMENT_STATUS_BUCKETS,
+        }
+        supabase.update(
+            "shipment_status_summary_job_runs",
+            {"id": f"eq.{job_id}"},
+            {
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "fetched_orders": len(orders),
+                "result": result,
+            },
+        )
+    except Exception as error:
+        logger.exception("shipment_status_summary_job_failed job_id=%s", job_id)
+        try:
+            supabase.update(
+                "shipment_status_summary_job_runs",
+                {"id": f"eq.{job_id}"},
+                {
+                    "status": "failed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error_message": str(error),
+                },
+            )
+        except Exception:
+            logger.exception("shipment_status_summary_job_status_update_failed job_id=%s", job_id)
 
 
 @app.get(
@@ -568,6 +757,7 @@ async def get_shipment_status_summary(
     summary="List Orders With Positive Discounts",
 )
 async def get_discounted_orders(
+    background_tasks: BackgroundTasks,
     from_date: date = Query(..., alias="from"),
     to_date: date = Query(..., alias="to"),
     per_page: int = Query(100, ge=1, le=100),
@@ -578,31 +768,116 @@ async def get_discounted_orders(
             detail="from date must be less than or equal to to date.",
         )
 
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is required to track background jobs")
+
+    job_id = str(uuid4())
     try:
-        orders = await run_in_threadpool(
-            get_shiprocket_client().fetch_orders,
-            start_date=from_date,
-            end_date=to_date,
+        supabase.insert("discounted_orders_job_runs", {
+            "id": job_id,
+            "status": "queued",
+            "from_date": from_date.isoformat(),
+            "to_date": to_date.isoformat(),
+            "per_page": per_page,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as error:
+        logger.exception("discounted_orders_queue_failed")
+        raise HTTPException(status_code=502, detail=f"Unable to queue discounted orders job: {error}") from error
+
+    background_tasks.add_task(
+        run_discounted_orders_in_background,
+        job_id,
+        from_date.isoformat(),
+        to_date.isoformat(),
+        per_page,
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job_id,
+            "status": "queued",
+            "status_url": f"/api/orders/discounted/runs/{job_id}",
+        },
+    )
+
+
+@app.get(
+    "/api/orders/discounted/runs/{job_id}",
+    summary="Get Discounted Orders Job Status",
+)
+def get_discounted_orders_job_status(job_id: str):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+    try:
+        rows = supabase.get("discounted_orders_job_runs", {"id": f"eq.{job_id}"})
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Unable to read job status: {error}") from error
+    if not rows:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return rows[0]
+
+
+def run_discounted_orders_in_background(
+    job_id: str,
+    from_date_value: str,
+    to_date_value: str,
+    per_page: int,
+):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    try:
+        supabase.update(
+            "discounted_orders_job_runs",
+            {"id": f"eq.{job_id}"},
+            {"status": "running"},
+        )
+        orders = get_shiprocket_client().fetch_orders(
+            start_date=date.fromisoformat(from_date_value),
+            end_date=date.fromisoformat(to_date_value),
             max_pages=None,
             per_page=per_page,
         )
-    except ShiprocketError as error:
-        message = str(error)
-        status_code = 503 if "SHIPROCKET_" in message else 502
-        logger.warning("discounted_orders_failed status_code=%s error=%s", status_code, message)
-        raise HTTPException(status_code=status_code, detail=message) from error
-
-    discounted_orders = [
-        summarize_discounted_order(order)
-        for order in orders
-        if isinstance(order, dict) and get_order_discount(order) > 0
-    ]
-    return {
-        "from": from_date.isoformat(),
-        "to": to_date.isoformat(),
-        "discounted_orders_count": len(discounted_orders),
-        "orders": discounted_orders,
-    }
+        discounted_orders = [
+            summarize_discounted_order(order)
+            for order in orders
+            if isinstance(order, dict) and get_order_discount(order) > 0
+        ]
+        result = {
+            "from": from_date_value,
+            "to": to_date_value,
+            "discounted_orders_count": len(discounted_orders),
+            "orders": discounted_orders,
+        }
+        supabase.update(
+            "discounted_orders_job_runs",
+            {"id": f"eq.{job_id}"},
+            {
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "fetched_orders": len(orders),
+                "discounted_orders_count": len(discounted_orders),
+                "result": result,
+            },
+        )
+    except Exception as error:
+        logger.exception("discounted_orders_job_failed job_id=%s", job_id)
+        try:
+            supabase.update(
+                "discounted_orders_job_runs",
+                {"id": f"eq.{job_id}"},
+                {
+                    "status": "failed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error_message": str(error),
+                },
+            )
+        except Exception:
+            logger.exception("discounted_orders_job_status_update_failed job_id=%s", job_id)
 
 
 @app.get("/api/jobs/edd-breach/run", include_in_schema=False)
