@@ -15,6 +15,24 @@ Start-Process -FilePath python -ArgumentList '-m','uvicorn','main:app','--host',
 
 This example shows how to use FastAPI on Vercel with Serverless Functions using the [Python Runtime](https://vercel.com/docs/concepts/functions/serverless-functions/runtimes/python).
 
+## Project layout
+
+- `app/main.py` defines the FastAPI application.
+- `app/cron_jobs/` contains scheduled job entry points; `app/shipment_edd/`
+  contains shipment business logic.
+- `app/config/`, `app/database/`, `app/storage/`, and `app/health/` hold shared
+  settings and integrations.
+- `app/shopify/` contains Shopify webhook and Meta attribution logic.
+- `shopify_tools/` contains the standalone product document and Shopify catalog
+  scripts. Run them from the repository root, for example
+  `python -m shopify_tools.upload_products --shop <shop-url>`.
+- `scripts/shopify/` contains Shopify webhook test utilities.
+- `db/migrations/` contains ordered database migrations.
+
+The root `main.py` is retained as a local Uvicorn entry point; the Vercel
+function at `api/index.py` imports the app from `app/main.py`. New application
+code should import from the packages above.
+
 ## Shipment EDD Breach Job
 
 ## Shopify Orders Webhooks and Meta Purchase CAPI
@@ -86,13 +104,13 @@ Apply `db/migrations/002_shopify_webhook_events.sql`,
 `db/migrations/004_shopify_meta_attribution.sql`, and
 `db/migrations/005_shopify_meta_attribution_order_key.sql` using the existing
 `POST /api/shipments/edd-breaches/db/migrate` endpoint or run the SQL directly.
-The `send_shopify_webhook_test.py` helper marks its payload as a test order, so it
-is stored but deliberately does not generate a Meta Purchase. To send all events to
-Meta Test Events, set `META_TEST_FLAG=TRUE` and `META_CAPI_TEST_EVENT_CODE` in the
-deployment environment. To send one synthetic Purchase instead, keep the flag off,
-set the test code in Vercel and locally, then run
-`python .\send_shopify_webhook_test.py --meta-test`. This test uses a unique
-synthetic order ID.
+The `scripts/shopify/send_webhook_test.py` helper marks its payload as a test
+order, so it is stored but deliberately does not generate a Meta Purchase. To
+send all events to Meta Test Events, set `META_TEST_FLAG=TRUE` and
+`META_CAPI_TEST_EVENT_CODE` in the deployment environment. To send one synthetic
+Purchase instead, keep the flag off, set the test code in Vercel and locally,
+then run `python .\scripts\shopify\send_webhook_test.py --meta-test`. This test
+uses a unique synthetic order ID.
 
 ### Orders With Discounts
 
@@ -141,6 +159,13 @@ pending SQL files from `db/migrations/` using `POSTGRES_URL_NON_POOLING` or
 `POSTGRES_URL`, and records successful filenames in `public.app_migrations`.
 
 Vercel runs it every day at `03:30 UTC` / `09:00 IST` through `vercel.json`.
+
+The data retention cron runs at `GET /api/jobs/data-retention/run` each day at
+`04:00 UTC` / `09:30 IST`. It deletes rows older than seven days from the
+application tables using `created_at`, while preserving `public.app_migrations`.
+Apply `db/migrations/006_data_retention_timestamps.sql` through the existing
+migration endpoint before the retention cron runs. This also adds missing
+`created_at` / `updated_at` columns and timestamp indexes.
 
 ### Vercel Routing
 

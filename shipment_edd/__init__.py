@@ -1,2 +1,1 @@
-"""Shipment EDD breach job package."""
-
+"""Backward-compatible imports for the app.shipment_edd package."""
