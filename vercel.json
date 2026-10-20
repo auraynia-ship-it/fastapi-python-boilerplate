@@ -3,6 +3,10 @@
     {
       "path": "/api/jobs/edd-breach/run",
       "schedule": "30 3 * * *"
+    },
+    {
+      "path": "/api/jobs/data-retention/run",
+      "schedule": "0 4 * * *"
     }
   ]
 }
