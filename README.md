@@ -114,13 +114,21 @@ uses a unique synthetic order ID.
 
 ### Orders With Discounts
 
-List Shiprocket orders with a discount greater than zero in a date range:
+List Shiprocket orders with a discount greater than zero in a date range. The
+endpoint returns `202 Accepted` with a `job_id` and `status_url`; poll the status
+URL for progress and the final result:
 
 ```bash
 GET /api/orders/discounted?from=2026-09-01&to=2026-09-30
+GET /api/orders/discounted/runs/{job_id}
 ```
 
-The response includes each matching order's ID, AWB, and delivery status.
+The response includes each matching order's ID, AWB, delivery status, discount,
+`partial_cod_collected`, and `shipping_amount`. If the payload omits a separate
+shipping charge, the endpoint derives it from the order total and net subtotal,
+accounting for whether taxes are included.
+Job status and results are stored in Supabase and require migration
+`010_discounted_orders_jobs.sql` to be applied.
 
 The app includes a daily Shiprocket EDD breach job at:
 
@@ -155,6 +163,17 @@ To return only AWB codes:
 
 ```bash
 POST /api/shipments/movement-concerns/run?awb_only=true
+```
+
+The shipment status summary endpoint also runs asynchronously. It returns
+`202 Accepted` with a `job_id` and `status_url`; poll the status URL for the
+final summary. It supports the optional `channel_sku` and `per_page` query
+parameters. Job tracking requires Supabase and migration
+`009_shipment_status_summary_jobs.sql`.
+
+```http
+GET /api/shipments/status-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
+GET /api/shipments/status-summary/runs/{job_id}
 ```
 
 Operational checks:
