@@ -134,11 +134,22 @@ You can also trigger the same task manually from the API docs with:
 POST /api/shipments/edd-breaches/run
 ```
 
+The endpoint returns `202 Accepted` with a `job_id` and `status_url`. Poll the
+status URL to see whether the run is `queued`, `running`, `completed`, or
+`failed`, along with its result fields when complete. Job tracking requires
+Supabase configuration. Apply pending migrations before using this endpoint.
+
 To find stuck or slow-moving shipments separately from EDD breaches:
 
 ```bash
 POST /api/shipments/movement-concerns/run
 ```
+
+This endpoint returns `202 Accepted` with a `job_id` and `status_url`. Poll
+`GET /api/shipments/movement-concerns/runs/{job_id}` for the run status, report
+URL, and stored concern details. Completed non-dry runs upload the CSV to Vercel
+Blob when `BLOB_READ_WRITE_TOKEN` is configured. Job runs and concern rows are
+stored in Supabase; apply pending migrations before using this endpoint.
 
 To return only AWB codes:
 
@@ -191,8 +202,9 @@ The movement-concerns endpoint:
 - fetches Shiprocket orders for the configured lookback window
 - flags open shipments that are stuck, near EDD with stale movement, breached, or carrying concerning carrier statuses
 - skips shipments with status `Out for Pickup` or `Pickup Scheduled`
-- returns `movement_concerns_found`, `movement_concerns`, and `report_csv_path`
-- returns `awb_codes` instead of full details when `awb_only=true`
+- the status URL returns `movement_concerns_found`, report paths, and stored concern details
+- when started with `awb_only=true`, the status URL returns `awb_codes` without the full concern list
+- stores each run in `shipment_movement_concern_job_runs` and each detected concern in `shipment_movement_concerns`
 - includes AWB, severity, reason list, EDD, last movement date, days since last movement, courier, and current status for each concern
 
 Run this SQL in Supabase before enabling the cron:
@@ -216,7 +228,7 @@ SHIPROCKET_PASSWORD=
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 EDD_JOB_TIMEZONE=Asia/Kolkata
-SHIPROCKET_ORDER_WINDOW_DAYS=45
+SHIPROCKET_ORDER_WINDOW_DAYS=30
 SHIPROCKET_MAX_PAGES=20
 SHIPROCKET_PER_PAGE=100
 EDD_REPORT_DIR=reports
@@ -258,6 +270,7 @@ For local testing:
 ```bash
 curl "http://localhost:3000/api/jobs/edd-breach/run?dry_run=true"
 curl -X POST "http://localhost:3000/api/shipments/edd-breaches/run?dry_run=true"
+curl "http://localhost:3000/api/shipments/edd-breaches/runs/<job_id>"
 curl -X POST "http://localhost:3000/api/shipments/movement-concerns/run?dry_run=true"
 curl -X POST "http://localhost:3000/api/shipments/movement-concerns/run?dry_run=true&awb_only=true"
 curl "http://localhost:3000/api/shipments/edd-breaches/health"

@@ -73,7 +73,7 @@ def get_edd_job_settings():
         ),
         blob_access=os.getenv("EDD_REPORT_BLOB_ACCESS", "public"),
         blob_prefix=os.getenv("EDD_REPORT_BLOB_PREFIX", "edd-breach-reports"),
-        order_window_days=_int_env("SHIPROCKET_ORDER_WINDOW_DAYS", 45),
+        order_window_days=_int_env("SHIPROCKET_ORDER_WINDOW_DAYS", 30),
         max_pages=_int_env("SHIPROCKET_MAX_PAGES", 20),
         per_page=_int_env("SHIPROCKET_PER_PAGE", 100),
         report_dir=os.getenv("EDD_REPORT_DIR", default_report_dir),

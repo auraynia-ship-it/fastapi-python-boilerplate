@@ -21,6 +21,50 @@ class SupabaseRestClient:
     def insert(self, table, rows, returning="representation"):
         return self._write(table, rows, returning=returning)
 
+    def get(self, table, filters, select="*"):
+        if not self.enabled:
+            return []
+        params = {"select": select, **filters}
+        request = Request(
+            f"{self.url}/rest/v1/{table}?{urlencode(params)}",
+            headers={"apikey": self.key, "Authorization": f"Bearer {self.key}"},
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body else []
+        except HTTPError as error:
+            detail = error.read().decode("utf-8") if error.fp else error.reason
+            raise SupabaseError(f"Supabase API error {error.code}: {detail}") from error
+        except (URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise SupabaseError(f"Unable to call Supabase REST API: {error}") from error
+
+    def update(self, table, filters, values):
+        query = urlencode(filters)
+        request = Request(
+            f"{self.url}/rest/v1/{table}?{query}",
+            data=json.dumps(values).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+                "Prefer": "return=representation",
+            },
+            method="PATCH",
+        )
+        if not self.enabled:
+            return []
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                body = response.read().decode("utf-8")
+                return json.loads(body) if body else []
+        except HTTPError as error:
+            detail = error.read().decode("utf-8") if error.fp else error.reason
+            raise SupabaseError(f"Supabase API error {error.code}: {detail}") from error
+        except (URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise SupabaseError(f"Unable to call Supabase REST API: {error}") from error
+
     def upsert(self, table, rows, on_conflict, returning="representation"):
         query = urlencode({"on_conflict": on_conflict})
         return self._write(

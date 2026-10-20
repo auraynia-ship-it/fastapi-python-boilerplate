@@ -4,9 +4,10 @@ import os
 import base64
 import hashlib
 import hmac
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 
@@ -18,6 +19,7 @@ from app.cron_jobs.shipment_edd import (
 )
 from app.cron_jobs.data_retention import run_data_retention_job
 from app.shipment_edd.shiprocket import ShiprocketClient, ShiprocketError
+from app.database.supabase import SupabaseRestClient
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from app.shopify.meta import (
     MetaDeliveryError,
@@ -621,9 +623,49 @@ def run_data_retention():
 
 @app.post("/api/shipments/edd-breaches/run", summary="Run Shipment EDD Breach Job")
 async def run_shipment_edd_breach_job_endpoint(
+    background_tasks: BackgroundTasks,
     dry_run: bool = Query(False),
 ):
-    return await execute_shipment_edd_breach_job(dry_run)
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is required to track background jobs")
+    job_id = str(uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        supabase.insert("shipment_edd_job_runs", {
+            "id": job_id,
+            "job_name": "shipment_edd_breach",
+            "status": "queued",
+            "started_at": now,
+            "dry_run": dry_run,
+        })
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Unable to queue job: {error}") from error
+    background_tasks.add_task(run_edd_breach_job_in_background, job_id, dry_run)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job_id,
+            "status": "queued",
+            "status_url": f"/api/shipments/edd-breaches/runs/{job_id}",
+        },
+    )
+
+
+@app.get("/api/shipments/edd-breaches/runs/{job_id}", summary="Get EDD Breach Job Status")
+def get_shipment_edd_breach_job_status(job_id: str):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+    try:
+        rows = supabase.get("shipment_edd_job_runs", {"id": f"eq.{job_id}"})
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Unable to read job status: {error}") from error
+    if not rows:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return rows[0]
 
 
 @app.post(
@@ -631,10 +673,114 @@ async def run_shipment_edd_breach_job_endpoint(
     summary="Run Shipment Movement Concern Job",
 )
 async def run_shipment_movement_concern_job_endpoint(
+    background_tasks: BackgroundTasks,
     dry_run: bool = Query(False),
     awb_only: bool = Query(False),
 ):
-    return await execute_shipment_movement_concern_job(dry_run, awb_only)
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is required to track background jobs")
+    job_id = str(uuid4())
+    try:
+        supabase.insert("shipment_movement_concern_job_runs", {
+            "id": job_id,
+            "status": "queued",
+            "dry_run": dry_run,
+            "awb_only": awb_only,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Unable to queue job: {error}") from error
+    background_tasks.add_task(
+        run_movement_concern_job_in_background, job_id, dry_run, awb_only
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job_id,
+            "status": "queued",
+            "status_url": f"/api/shipments/movement-concerns/runs/{job_id}",
+        },
+    )
+
+
+@app.get(
+    "/api/shipments/movement-concerns/runs/{job_id}",
+    summary="Get Shipment Movement Concern Job Status",
+)
+def get_shipment_movement_concern_job_status(job_id: str):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+    try:
+        rows = supabase.get("shipment_movement_concern_job_runs", {"id": f"eq.{job_id}"})
+        if not rows:
+            raise HTTPException(status_code=404, detail="Job not found")
+        result = rows[0]
+        if result.get("status") == "completed" and not result.get("awb_only"):
+            concerns = supabase.get(
+                "shipment_movement_concerns",
+                {"job_run_id": f"eq.{job_id}"},
+                select="awb_code,severity,reasons,edd,days_until_edd,days_since_last_movement,last_movement_date,shiprocket_order_id,channel_order_id,shipment_id,courier_name,status",
+            )
+            result["movement_concerns"] = concerns
+        return result
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Unable to read job status: {error}") from error
+
+
+def run_movement_concern_job_in_background(job_id: str, dry_run: bool, awb_only: bool):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    try:
+        supabase.update(
+            "shipment_movement_concern_job_runs",
+            {"id": f"eq.{job_id}"},
+            {"status": "running"},
+        )
+        run_shipment_movement_concern_job(
+            dry_run=dry_run, awb_only=awb_only, job_run_id=job_id
+        )
+    except Exception as error:
+        logger.exception("movement_concern_background_job_failed job_id=%s", job_id)
+        try:
+            supabase.update(
+                "shipment_movement_concern_job_runs",
+                {"id": f"eq.{job_id}"},
+                {
+                    "status": "failed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error_message": str(error),
+                },
+            )
+        except Exception:
+            logger.exception("movement_concern_job_status_update_failed job_id=%s", job_id)
+
+
+def run_edd_breach_job_in_background(job_id: str, dry_run: bool):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    try:
+        supabase.update("shipment_edd_job_runs", {"id": f"eq.{job_id}"}, {"status": "running"})
+        run_edd_breach_job(dry_run=dry_run, job_run_id=job_id)
+    except Exception as error:
+        logger.exception("edd_breach_background_job_failed job_id=%s", job_id)
+        try:
+            supabase.update(
+                "shipment_edd_job_runs",
+                {"id": f"eq.{job_id}"},
+                {
+                    "status": "failed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error_message": str(error),
+                },
+            )
+        except Exception:
+            logger.exception("edd_breach_background_job_status_update_failed job_id=%s", job_id)
 
 
 @app.get("/api/db/health", summary="Check Shipment EDD System Health")

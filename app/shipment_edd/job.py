@@ -61,7 +61,7 @@ SKIPPED_MOVEMENT_CONCERN_STATUSES = ("out for pickup", "pickup scheduled")
 logger = logging.getLogger(__name__)
 
 
-def run_edd_breach_job(today=None, dry_run=False):
+def run_edd_breach_job(today=None, dry_run=False, job_run_id=None):
     settings = get_edd_job_settings()
     today = today or business_today(settings.timezone)
     started_at = datetime.now(timezone.utc)
@@ -181,10 +181,15 @@ def run_edd_breach_job(today=None, dry_run=False):
         "awb_codes": [breach["awb_code"] for breach in breaches],
     }
 
-    if not dry_run:
+    if job_run_id:
+        supabase.update("shipment_edd_job_runs", {"id": f"eq.{job_run_id}"}, job_run)
+    elif not dry_run:
         logger.info("edd_breach_persist_started")
-        persisted_run = supabase.insert("shipment_edd_job_runs", job_run)
-        job_run_id = persisted_run[0].get("id") if persisted_run else None
+        if not job_run_id:
+            persisted_run = supabase.insert("shipment_edd_job_runs", job_run)
+            job_run_id = persisted_run[0].get("id") if persisted_run else None
+
+    if not dry_run:
         logger.info("edd_breach_job_run_persisted job_run_id=%s", job_run_id)
 
         if snapshots:
@@ -237,7 +242,9 @@ def run_edd_breach_job(today=None, dry_run=False):
     }
 
 
-def run_shipment_movement_concern_job(today=None, dry_run=False, awb_only=False):
+def run_shipment_movement_concern_job(
+    today=None, dry_run=False, awb_only=False, job_run_id=None
+):
     settings = get_edd_job_settings()
     today = today or business_today(settings.timezone)
     logger.info(
@@ -288,6 +295,19 @@ def run_shipment_movement_concern_job(today=None, dry_run=False, awb_only=False)
         today,
     )
 
+    report_blob_url = None
+    if not dry_run and report_csv_path and settings.blob_rw_token:
+        content = Path(report_csv_path).read_bytes()
+        pathname = f"{settings.blob_prefix}/movement-concerns/shipment_movement_concerns_{today.isoformat()}.csv"
+        blob = upload_bytes_to_vercel_blob(
+            pathname=pathname,
+            content=content,
+            content_type="text/csv; charset=utf-8",
+            access=settings.blob_access,
+            token=settings.blob_rw_token,
+        )
+        report_blob_url = blob.url
+
     if not dry_run and snapshots:
         supabase.upsert(
             "shipment_snapshots",
@@ -298,6 +318,27 @@ def run_shipment_movement_concern_job(today=None, dry_run=False, awb_only=False)
         logger.info("shipment_movement_concern_snapshots_upserted count=%s", len(snapshots))
     elif dry_run:
         logger.info("shipment_movement_concern_persist_skipped reason=dry_run_enabled")
+
+    completed_at = datetime.now(timezone.utc).isoformat()
+    run_values = {
+        "status": "completed",
+        "completed_at": completed_at,
+        "orders_fetched": len(orders),
+        "shipments_checked": len(snapshots),
+        "movement_concerns_found": len(movement_concerns),
+        "report_csv_path": str(report_csv_path) if report_csv_path else None,
+        "report_blob_url": report_blob_url,
+        "awb_codes": [concern["awb_code"] for concern in movement_concerns],
+    }
+    if job_run_id:
+        supabase.update("shipment_movement_concern_job_runs", {"id": f"eq.{job_run_id}"}, run_values)
+        if not dry_run and movement_concerns:
+            supabase.upsert(
+                "shipment_movement_concerns",
+                [{**concern, "job_run_id": job_run_id, "concern_date": today.isoformat()} for concern in movement_concerns],
+                on_conflict="job_run_id,awb_code",
+                returning="minimal",
+            )
 
     logger.info(
         "shipment_movement_concern_job_completed orders_fetched=%s "
@@ -315,6 +356,7 @@ def run_shipment_movement_concern_job(today=None, dry_run=False, awb_only=False)
         "shipments_checked": len(snapshots),
         "movement_concerns_found": len(movement_concerns),
         "report_csv_path": str(report_csv_path) if report_csv_path else None,
+        "report_blob_url": report_blob_url,
     }
     if awb_only:
         response["awb_codes"] = awb_codes
