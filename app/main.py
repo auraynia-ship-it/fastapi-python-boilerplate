@@ -149,6 +149,7 @@ def summarize_packets_by_status(orders, channel_sku):
         "in_transit": 0,
     }
     ignored_statuses = {}
+    rto_statuses = {}
     matched_packets = 0
 
     for order in orders:
@@ -159,12 +160,15 @@ def summarize_packets_by_status(orders, channel_sku):
         bucket = classify_shipment_status(order.get("status"))
         if bucket:
             summary[bucket] += 1
+            if bucket == "rto":
+                status = str(order.get("status") or "UNKNOWN").strip()
+                rto_statuses[status] = rto_statuses.get(status, 0) + 1
             continue
 
         status = str(order.get("status") or "UNKNOWN")
         ignored_statuses[status] = ignored_statuses.get(status, 0) + 1
 
-    return summary, matched_packets, ignored_statuses
+    return summary, matched_packets, ignored_statuses, rto_statuses
 
 
 def summarize_shopify_order_payload(payload):
@@ -712,7 +716,7 @@ def run_shipment_status_summary_in_background(
             max_pages=None,
             per_page=per_page,
         )
-        summary, matched_packets, ignored_statuses = summarize_packets_by_status(
+        summary, matched_packets, ignored_statuses, rto_statuses = summarize_packets_by_status(
             orders, channel_sku
         )
         result = {
@@ -720,6 +724,7 @@ def run_shipment_status_summary_in_background(
             "to": to_date_value,
             "channel_sku": channel_sku or None,
             "packets": summary,
+            "rto_statuses": rto_statuses,
             "matched_packets": matched_packets,
             "ignored_packets": sum(ignored_statuses.values()),
             "ignored_statuses": ignored_statuses,

@@ -169,7 +169,10 @@ The shipment status summary endpoint also runs asynchronously. It returns
 `202 Accepted` with a `job_id` and `status_url`; poll the status URL for the
 final summary. It supports the optional `channel_sku` and `per_page` query
 parameters. Job tracking requires Supabase and migration
-`009_shipment_status_summary_jobs.sql`.
+`009_shipment_status_summary_jobs.sql`. The result's `rto_statuses` field
+breaks down RTO packets by their original Shiprocket status (for example,
+`RTO DELIVERED` and `RTO IN TRANSIT`), alongside the aggregate `packets.rto`
+count.
 
 ```http
 GET /api/shipments/status-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
