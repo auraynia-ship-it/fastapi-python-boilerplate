@@ -1,7 +1,12 @@
 import json
+import logging
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+
+logger = logging.getLogger(__name__)
 
 
 class SupabaseError(RuntimeError):
@@ -73,6 +78,54 @@ class SupabaseRestClient:
             query=query,
             prefer=f"resolution=merge-duplicates,return={returning}",
         )
+
+    def upsert_in_batches(
+        self,
+        table,
+        rows,
+        on_conflict,
+        batch_size=100,
+        returning="minimal",
+        retries=2,
+    ):
+        """Upsert large row sets in smaller, retryable idempotent batches."""
+        if not isinstance(rows, list):
+            rows = [rows]
+        results = []
+        total_batches = (len(rows) + batch_size - 1) // batch_size
+        for batch_number, start in enumerate(range(0, len(rows), batch_size), start=1):
+            batch = rows[start : start + batch_size]
+            for attempt in range(retries + 1):
+                try:
+                    batch_result = self.upsert(
+                        table,
+                        batch,
+                        on_conflict=on_conflict,
+                        returning=returning,
+                    )
+                    if batch_result:
+                        results.extend(batch_result)
+                    break
+                except SupabaseError as error:
+                    cause = error.__cause__
+                    transient = isinstance(cause, TimeoutError) or (
+                        isinstance(cause, URLError) and not isinstance(cause, HTTPError)
+                    )
+                    if not transient or attempt >= retries:
+                        raise SupabaseError(
+                            f"Supabase upsert failed for {table} batch "
+                            f"{batch_number}/{total_batches}: {error}"
+                        ) from error
+                    logger.warning(
+                        "supabase_upsert_batch_retry table=%s batch=%s/%s attempt=%s error_type=%s",
+                        table,
+                        batch_number,
+                        total_batches,
+                        attempt + 1,
+                        type(cause).__name__,
+                    )
+                    time.sleep(0.5 * (attempt + 1))
+        return results
 
     def table_exists(self, table):
         if not self.enabled:
