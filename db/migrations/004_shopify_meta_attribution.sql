@@ -8,3 +8,5 @@ CREATE TABLE IF NOT EXISTS public.shopify_meta_attribution (
 
 CREATE INDEX IF NOT EXISTS shopify_meta_attribution_expires_at_idx
     ON public.shopify_meta_attribution (expires_at);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.shopify_meta_attribution TO service_role;

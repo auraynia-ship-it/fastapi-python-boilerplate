@@ -82,4 +82,9 @@ before update on public.shipment_snapshots
 for each row
 execute function public.touch_shipment_snapshot_updated_at();
 
+grant select, insert, update, delete on table public.app_migrations to service_role;
+grant select, insert, update, delete on table public.shipment_edd_job_runs to service_role;
+grant select, insert, update, delete on table public.shipment_snapshots to service_role;
+grant select, insert, update, delete on table public.shipment_edd_breaches to service_role;
+
 notify pgrst, 'reload schema';

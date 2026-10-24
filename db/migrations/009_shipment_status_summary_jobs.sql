@@ -16,4 +16,6 @@ CREATE TABLE IF NOT EXISTS public.shipment_status_summary_job_runs (
 CREATE INDEX IF NOT EXISTS shipment_status_summary_job_runs_created_at_idx
     ON public.shipment_status_summary_job_runs (created_at);
 
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.shipment_status_summary_job_runs TO service_role;
+
 NOTIFY pgrst, 'reload schema';

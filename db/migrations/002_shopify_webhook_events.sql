@@ -14,3 +14,6 @@ CREATE TABLE IF NOT EXISTS public.shopify_webhook_events (
 
 CREATE INDEX IF NOT EXISTS shopify_webhook_events_order_id_idx
     ON public.shopify_webhook_events (order_id);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.shopify_webhook_events TO service_role;
+GRANT USAGE, SELECT ON SEQUENCE public.shopify_webhook_events_id_seq TO service_role;

@@ -39,4 +39,7 @@ CREATE TABLE IF NOT EXISTS public.shipment_movement_concerns (
 CREATE INDEX IF NOT EXISTS shipment_movement_concerns_awb_date_idx
     ON public.shipment_movement_concerns (awb_code, concern_date);
 
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.shipment_movement_concern_job_runs TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.shipment_movement_concerns TO service_role;
+
 NOTIFY pgrst, 'reload schema';

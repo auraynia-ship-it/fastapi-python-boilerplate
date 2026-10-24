@@ -7,7 +7,7 @@ import hmac
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 
@@ -20,6 +20,7 @@ from app.cron_jobs.shipment_edd import (
 from app.cron_jobs.data_retention import run_data_retention_job
 from app.shipment_edd.shiprocket import ShiprocketClient, ShiprocketError
 from app.database.supabase import SupabaseRestClient
+from app.notifications.shipment_status_email import send_shipment_status_summary_email
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from app.shopify.meta import (
     MetaDeliveryError,
@@ -55,6 +56,33 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.post("/api/notifications/email/test", include_in_schema=True)
+def send_email_test(x_email_test_token: str | None = Header(None)):
+    settings = get_edd_job_settings()
+    if not settings.email_test_endpoint_token:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not x_email_test_token or not hmac.compare_digest(
+        x_email_test_token, settings.email_test_endpoint_token
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        sent = send_shipment_status_summary_email(
+            settings,
+            "smtp-test",
+            {},
+            test=True,
+        )
+    except Exception as error:
+        logger.exception("shipment_status_summary_smtp_test_failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"SMTP test failed ({type(error).__name__}). Check server logs for details.",
+        ) from error
+    if not sent:
+        raise HTTPException(status_code=503, detail="Email settings or recipients are missing")
+    return {"status": "sent", "recipients": "configured recipient list"}
 
 
 @app.middleware("http")
@@ -119,7 +147,10 @@ def order_has_channel_sku(order, channel_sku):
     if not channel_sku:
         return True
 
-    expected_sku = channel_sku.strip().casefold()
+    sku_values = channel_sku if isinstance(channel_sku, (list, tuple, set)) else [channel_sku]
+    expected_skus = {str(value).strip().casefold() for value in sku_values if str(value).strip()}
+    if not expected_skus:
+        return False
     products = order.get("products", [])
     if not isinstance(products, list):
         return False
@@ -128,7 +159,7 @@ def order_has_channel_sku(order, channel_sku):
         if not isinstance(product, dict):
             continue
         product_sku = str(product.get("channel_sku", "")).strip().casefold()
-        if product_sku == expected_sku:
+        if product_sku in expected_skus:
             return True
 
     return False
@@ -169,6 +200,25 @@ def summarize_packets_by_status(orders, channel_sku):
         ignored_statuses[status] = ignored_statuses.get(status, 0) + 1
 
     return summary, matched_packets, ignored_statuses, rto_statuses
+
+
+def parse_shipment_status_summary_skus(raw_value):
+    """Parse comma-separated display-name:channel-sku entries."""
+    configured_skus = []
+    for entry in (raw_value or "").split(","):
+        name, separator, channel_sku = entry.partition(":")
+        name = name.strip()
+        channel_sku = channel_sku.strip()
+        if name and separator and channel_sku:
+            configured_skus.append({"name": name, "channel_sku": channel_sku})
+    return configured_skus
+
+
+def group_shipment_status_summary_skus(configured_skus):
+    grouped = {}
+    for configured_sku in configured_skus:
+        grouped.setdefault(configured_sku["name"], []).append(configured_sku["channel_sku"])
+    return grouped
 
 
 def summarize_shopify_order_payload(payload):
@@ -621,8 +671,6 @@ async def get_shipment_status_summary(
     background_tasks: BackgroundTasks,
     from_date: date = Query(..., alias="from"),
     to_date: date = Query(..., alias="to"),
-    channel_sku: str | None = Query(None),
-    per_page: int = Query(100, ge=1, le=100),
 ):
     if from_date > to_date:
         raise HTTPException(
@@ -630,16 +678,23 @@ async def get_shipment_status_summary(
             detail="from date must be less than or equal to to date.",
         )
 
-    normalized_sku = channel_sku.strip() if channel_sku else ""
+    settings = get_edd_job_settings()
+    configured_skus = parse_shipment_status_summary_skus(
+        settings.shipment_status_summary_skus
+    )
+    if not configured_skus:
+        raise HTTPException(
+            status_code=503,
+            detail="SHIPMENT_STATUS_SUMMARY_SKUS must contain name:channel_sku entries",
+        )
     logger.info(
-        "shipment_status_summary_request from=%s to=%s channel_sku=%s per_page=%s",
+        "shipment_status_summary_request from=%s to=%s sku_count=%s per_page=%s",
         from_date,
         to_date,
-        normalized_sku or "ALL",
-        per_page,
+        len(configured_skus),
+        settings.per_page,
     )
 
-    settings = get_edd_job_settings()
     supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
     if not supabase.enabled:
         raise HTTPException(status_code=503, detail="Supabase is required to track background jobs")
@@ -651,8 +706,8 @@ async def get_shipment_status_summary(
             "status": "queued",
             "from_date": from_date.isoformat(),
             "to_date": to_date.isoformat(),
-            "channel_sku": normalized_sku or None,
-            "per_page": per_page,
+            "channel_sku": None,
+            "per_page": settings.per_page,
             "started_at": datetime.now(timezone.utc).isoformat(),
         })
     except Exception as error:
@@ -664,8 +719,7 @@ async def get_shipment_status_summary(
         job_id,
         from_date.isoformat(),
         to_date.isoformat(),
-        normalized_sku,
-        per_page,
+        settings.per_page,
     )
     return JSONResponse(
         status_code=202,
@@ -699,7 +753,6 @@ def run_shipment_status_summary_in_background(
     job_id: str,
     from_date_value: str,
     to_date_value: str,
-    channel_sku: str,
     per_page: int,
 ):
     settings = get_edd_job_settings()
@@ -716,19 +769,27 @@ def run_shipment_status_summary_in_background(
             max_pages=None,
             per_page=per_page,
         )
-        summary, matched_packets, ignored_statuses, rto_statuses = summarize_packets_by_status(
-            orders, channel_sku
+        configured_skus = parse_shipment_status_summary_skus(
+            settings.shipment_status_summary_skus
         )
+        sku_summaries = []
+        for sku_name, channel_skus in group_shipment_status_summary_skus(configured_skus).items():
+            summary, matched_packets, ignored_statuses, rto_statuses = summarize_packets_by_status(
+                orders, channel_skus
+            )
+            sku_summaries.append({
+                "name": sku_name,
+                "packets": summary,
+                "rto_statuses": rto_statuses,
+                "matched_packets": matched_packets,
+                "ignored_packets": sum(ignored_statuses.values()),
+                "ignored_statuses": ignored_statuses,
+            })
         result = {
             "from": from_date_value,
             "to": to_date_value,
-            "channel_sku": channel_sku or None,
-            "packets": summary,
-            "rto_statuses": rto_statuses,
-            "matched_packets": matched_packets,
-            "ignored_packets": sum(ignored_statuses.values()),
-            "ignored_statuses": ignored_statuses,
             "fetched_orders": len(orders),
+            "sku_summaries": sku_summaries,
             "status_keywords": SHIPMENT_STATUS_BUCKETS,
         }
         supabase.update(
@@ -741,6 +802,15 @@ def run_shipment_status_summary_in_background(
                 "result": result,
             },
         )
+        try:
+            email_sent = send_shipment_status_summary_email(settings, job_id, result)
+            logger.info(
+                "shipment_status_summary_email_completed job_id=%s sent=%s",
+                job_id,
+                email_sent,
+            )
+        except Exception:
+            logger.exception("shipment_status_summary_email_failed job_id=%s", job_id)
     except Exception as error:
         logger.exception("shipment_status_summary_job_failed job_id=%s", job_id)
         try:
