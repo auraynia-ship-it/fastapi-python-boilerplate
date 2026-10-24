@@ -128,7 +128,9 @@ The response includes each matching order's ID, AWB, delivery status, discount,
 shipping charge, the endpoint derives it from the order total and net subtotal,
 accounting for whether taxes are included.
 Job status and results are stored in Supabase and require migration
-`010_discounted_orders_jobs.sql` to be applied.
+`010_discounted_orders_jobs.sql` to be applied. Migration
+`011_service_role_table_grants.sql` grants the app's server-side Supabase role
+Data API access to its tables.
 
 The app includes a daily Shiprocket EDD breach job at:
 
@@ -167,12 +169,45 @@ POST /api/shipments/movement-concerns/run?awb_only=true
 
 The shipment status summary endpoint also runs asynchronously. It returns
 `202 Accepted` with a `job_id` and `status_url`; poll the status URL for the
-final summary. It supports the optional `channel_sku` and `per_page` query
-parameters. Job tracking requires Supabase and migration
-`009_shipment_status_summary_jobs.sql`. The result's `rto_statuses` field
-breaks down RTO packets by their original Shiprocket status (for example,
-`RTO DELIVERED` and `RTO IN TRANSIT`), alongside the aggregate `packets.rto`
-count.
+final summary. It reads `SHIPMENT_STATUS_SUMMARY_SKUS` from the environment
+and accepts only `from` and `to` dates in the request.
+Configure comma-separated `display name:channel SKU` pairs; the email and job
+result show the display names and do not expose the SKU values. The request
+accepts only `from` and `to` dates. Job tracking requires Supabase and migration
+`009_shipment_status_summary_jobs.sql`. The result and completion email contain
+separate packet, RTO, and ignored-status breakdowns for each configured display
+name. When Gmail SMTP is configured, a completion email containing the full
+summary result and job ID is sent after the result is saved. Set these
+environment variables in the deployment (or `.env` locally):
+
+```env
+GMAIL_APP_EMAIL=your-gmail-address@gmail.com
+GMAIL_APP_PASSWORD=your-16-character-google-app-password
+SHIPMENT_STATUS_SUMMARY_EMAIL_TO=recipient1@example.com,recipient2@example.com
+SHIPMENT_STATUS_SUMMARY_SKUS=Jewellery Chocolate:48297641869364,Bangle Box:BB-0024,Bangle Box:BB-0026
+```
+
+Separate multiple recipients with commas or semicolons.
+Separate SKU entries with commas and put a colon between each display name and
+its Shiprocket channel SKU. Entries with the same display name are grouped into
+one report, matching any of their listed SKU values.
+
+To test SMTP delivery independently, configure a long random
+`EMAIL_TEST_ENDPOINT_TOKEN` and call the protected test endpoint. It sends a
+message only to the configured recipient list:
+
+```env
+EMAIL_TEST_ENDPOINT_TOKEN=use-a-long-random-secret
+```
+
+```bash
+curl -X POST http://localhost:8000/api/notifications/email/test \
+  -H "X-Email-Test-Token: use-a-long-random-secret"
+```
+
+Create the app password in the Google Account used as `GMAIL_APP_EMAIL` and
+keep it secret. If any of these settings are missing, the summary job still
+completes and no email is sent.
 
 ```http
 GET /api/shipments/status-summary?from=YYYY-MM-DD&to=YYYY-MM-DD

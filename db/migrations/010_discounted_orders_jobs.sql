@@ -16,4 +16,6 @@ CREATE TABLE IF NOT EXISTS public.discounted_orders_job_runs (
 CREATE INDEX IF NOT EXISTS discounted_orders_job_runs_created_at_idx
     ON public.discounted_orders_job_runs (created_at);
 
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.discounted_orders_job_runs TO service_role;
+
 NOTIFY pgrst, 'reload schema';

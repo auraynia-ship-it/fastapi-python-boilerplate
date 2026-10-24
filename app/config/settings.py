@@ -20,7 +20,9 @@ def load_env_file(path=None):
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+        # A blank process-level value should not mask a configured .env value.
+        if not os.environ.get(key):
+            os.environ[key] = value
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,11 @@ class EddJobSettings:
     per_page: int
     report_dir: str
     timezone: str
+    gmail_app_email: str | None
+    gmail_app_password: str | None
+    shipment_status_summary_email_to: str | None
+    email_test_endpoint_token: str | None
+    shipment_status_summary_skus: str | None
 
 
 def _int_env(name, default):
@@ -78,4 +85,9 @@ def get_edd_job_settings():
         per_page=_int_env("SHIPROCKET_PER_PAGE", 100),
         report_dir=os.getenv("EDD_REPORT_DIR", default_report_dir),
         timezone=os.getenv("EDD_JOB_TIMEZONE", "Asia/Kolkata"),
+        gmail_app_email=os.getenv("GMAIL_APP_EMAIL"),
+        gmail_app_password=os.getenv("GMAIL_APP_PASSWORD"),
+        shipment_status_summary_email_to=os.getenv("SHIPMENT_STATUS_SUMMARY_EMAIL_TO"),
+        email_test_endpoint_token=os.getenv("EMAIL_TEST_ENDPOINT_TOKEN"),
+        shipment_status_summary_skus=os.getenv("SHIPMENT_STATUS_SUMMARY_SKUS"),
     )
