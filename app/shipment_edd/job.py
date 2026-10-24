@@ -193,7 +193,7 @@ def run_edd_breach_job(today=None, dry_run=False, job_run_id=None):
         logger.info("edd_breach_job_run_persisted job_run_id=%s", job_run_id)
 
         if snapshots:
-            supabase.upsert(
+            supabase.upsert_in_batches(
                 "shipment_snapshots",
                 snapshots,
                 on_conflict="awb_code",
@@ -206,7 +206,7 @@ def run_edd_breach_job(today=None, dry_run=False, job_run_id=None):
                 {**breach, "job_run_id": job_run_id}
                 for breach in breaches
             ]
-            supabase.upsert(
+            supabase.upsert_in_batches(
                 "shipment_edd_breaches",
                 breach_rows,
                 on_conflict="awb_code,breach_date",
@@ -309,7 +309,7 @@ def run_shipment_movement_concern_job(
         report_blob_url = blob.url
 
     if not dry_run and snapshots:
-        supabase.upsert(
+        supabase.upsert_in_batches(
             "shipment_snapshots",
             snapshots,
             on_conflict="awb_code",
@@ -333,7 +333,7 @@ def run_shipment_movement_concern_job(
     if job_run_id:
         supabase.update("shipment_movement_concern_job_runs", {"id": f"eq.{job_run_id}"}, run_values)
         if not dry_run and movement_concerns:
-            supabase.upsert(
+            supabase.upsert_in_batches(
                 "shipment_movement_concerns",
                 [{**concern, "job_run_id": job_run_id, "concern_date": today.isoformat()} for concern in movement_concerns],
                 on_conflict="job_run_id,awb_code",
