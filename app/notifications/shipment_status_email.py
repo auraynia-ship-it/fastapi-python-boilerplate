@@ -108,11 +108,50 @@ def _summary_email_bodies(job_id, result):
     return text_body, html_body
 
 
-def send_shipment_status_summary_email(settings, job_id, result, test=False):
-    """Send the completed summary to the configured recipient, if enabled."""
+def _generic_job_email_bodies(title, job_id, result):
+    text_body = (
+        f"{title} job completed.\n"
+        f"Job ID: {job_id}\n\n"
+        f"Complete result details (JSON):\n"
+        f"{json.dumps(result, indent=2, ensure_ascii=False, default=str)}\n"
+    )
+    detail_rows = "".join(
+        "<tr>"
+        f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;vertical-align:top">{escape(str(key))}</td>'
+        '<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">'
+        f'<pre style="white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:13px Arial,sans-serif">{escape(json.dumps(value, indent=2, ensure_ascii=False, default=str))}</pre>'
+        "</td></tr>"
+        for key, value in result.items()
+    )
+    html_body = (
+        '<div style="margin:0;background:#f3f4f6;padding:24px;font-family:Arial,sans-serif;'
+        'color:#111827"><div style="max-width:760px;margin:0 auto;background:#f9fafb;'
+        'padding:24px;border-radius:10px">'
+        '<div style="font-size:12px;font-weight:700;letter-spacing:.08em;color:#2563eb;'
+        'text-transform:uppercase">Job report</div>'
+        f'<h1 style="font-size:24px;margin:8px 0 20px">{escape(title)} completed</h1>'
+        '<table role="presentation" style="width:100%;border-collapse:collapse;'
+        'background:#fff;border:1px solid #e5e7eb">'
+        f"{detail_rows}</table>"
+        '<div style="margin-top:24px;padding-top:16px;border-top:1px solid #d1d5db;'
+        'font-size:12px;color:#6b7280">'
+        f"Job ID: {escape(str(job_id))}</div></div></div>"
+    )
+    return text_body, html_body
+
+
+def send_shipment_status_summary_email(
+    settings, job_id, result, test=False, recipients_setting=None, job_title=None
+):
+    """Send a job completion email to the selected configured recipient list."""
+    recipients_setting = (
+        recipients_setting
+        if recipients_setting is not None
+        else settings.shipment_status_summary_email_to
+    )
     recipients = [
         address.strip()
-        for address in re.split(r"[,;\n]+", settings.shipment_status_summary_email_to or "")
+        for address in re.split(r"[,;\n]+", recipients_setting or "")
         if address.strip()
     ]
     if not (
@@ -123,11 +162,13 @@ def send_shipment_status_summary_email(settings, job_id, result, test=False):
         return False
 
     message = EmailMessage()
-    message["Subject"] = (
-        "Shipment status summary SMTP test"
-        if test
-        else f"Shipment status summary: {result['from']} to {result['to']}"
-    )
+    if test:
+        subject = "Shipment status summary SMTP test"
+    elif job_title:
+        subject = f"{job_title} completed"
+    else:
+        subject = f"Shipment status summary: {result['from']} to {result['to']}"
+    message["Subject"] = subject
     message["From"] = settings.gmail_app_email
     message["To"] = ", ".join(recipients)
     if test:
@@ -146,7 +187,10 @@ def send_shipment_status_summary_email(settings, job_id, result, test=False):
         )
         message.add_alternative(html_body, subtype="html")
     else:
-        text_body, html_body = _summary_email_bodies(job_id, result)
+        if job_title:
+            text_body, html_body = _generic_job_email_bodies(job_title, job_id, result)
+        else:
+            text_body, html_body = _summary_email_bodies(job_id, result)
         message.set_content(text_body)
         message.add_alternative(html_body, subtype="html")
 
