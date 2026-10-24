@@ -46,6 +46,9 @@ class EddJobSettings:
     shipment_status_summary_email_to: str | None
     email_test_endpoint_token: str | None
     shipment_status_summary_skus: str | None
+    discounted_orders_email_to: str | None
+    shipment_edd_breach_email_to: str | None
+    shipment_movement_concerns_email_to: str | None
 
 
 def _int_env(name, default):
@@ -90,4 +93,7 @@ def get_edd_job_settings():
         shipment_status_summary_email_to=os.getenv("SHIPMENT_STATUS_SUMMARY_EMAIL_TO"),
         email_test_endpoint_token=os.getenv("EMAIL_TEST_ENDPOINT_TOKEN"),
         shipment_status_summary_skus=os.getenv("SHIPMENT_STATUS_SUMMARY_SKUS"),
+        discounted_orders_email_to=os.getenv("DISCOUNTED_ORDERS_EMAIL_TO"),
+        shipment_edd_breach_email_to=os.getenv("EDD_BREACH_EMAIL_TO"),
+        shipment_movement_concerns_email_to=os.getenv("SHIPMENT_MOVEMENT_CONCERNS_EMAIL_TO"),
     )

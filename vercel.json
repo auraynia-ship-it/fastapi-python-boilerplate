@@ -2,11 +2,23 @@
   "crons": [
     {
       "path": "/api/jobs/edd-breach/run",
-      "schedule": "30 3 * * *"
+      "schedule": "30 16 * * *"
     },
     {
       "path": "/api/jobs/data-retention/run",
       "schedule": "0 4 * * *"
+    },
+    {
+      "path": "/api/jobs/shipment-status-summary/run",
+      "schedule": "30 14 * * *"
+    },
+    {
+      "path": "/api/jobs/discounted-orders/run",
+      "schedule": "30 13 * * *"
+    },
+    {
+      "path": "/api/jobs/shipment-movement-concerns/run",
+      "schedule": "30 15 * * *"
     }
   ]
 }

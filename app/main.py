@@ -6,6 +6,7 @@ import hashlib
 import hmac
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -219,6 +220,42 @@ def group_shipment_status_summary_skus(configured_skus):
     for configured_sku in configured_skus:
         grouped.setdefault(configured_sku["name"], []).append(configured_sku["channel_sku"])
     return grouped
+
+
+def send_job_completion_email(settings, job_id, result, recipients, job_title, log_name):
+    try:
+        sent = send_shipment_status_summary_email(
+            settings,
+            job_id,
+            result,
+            recipients_setting=recipients,
+            job_title=job_title,
+        )
+        logger.info("%s_email_completed job_id=%s sent=%s", log_name, job_id, sent)
+    except Exception:
+        logger.exception("%s_email_failed job_id=%s", log_name, job_id)
+
+
+def require_vercel_cron_auth(request: Request):
+    cron_secret = os.getenv("CRON_SECRET")
+    authorization = request.headers.get("authorization", "")
+    if not cron_secret or not hmac.compare_digest(
+        authorization, f"Bearer {cron_secret}"
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def previous_job_date(settings):
+    try:
+        job_timezone = ZoneInfo(settings.timezone)
+    except ZoneInfoNotFoundError:
+        job_timezone = timezone.utc
+    return datetime.now(job_timezone).date() - timedelta(days=1)
+
+
+def previous_30_day_range(settings):
+    end_date = previous_job_date(settings)
+    return end_date - timedelta(days=29), end_date
 
 
 def summarize_shopify_order_payload(payload):
@@ -803,14 +840,16 @@ def run_shipment_status_summary_in_background(
             },
         )
         try:
-            email_sent = send_shipment_status_summary_email(settings, job_id, result)
-            logger.info(
-                "shipment_status_summary_email_completed job_id=%s sent=%s",
+            send_job_completion_email(
+                settings,
                 job_id,
-                email_sent,
+                result,
+                settings.shipment_status_summary_email_to,
+                "Shipment status summary",
+                "shipment_status_summary",
             )
         except Exception:
-            logger.exception("shipment_status_summary_email_failed job_id=%s", job_id)
+            logger.exception("shipment_status_summary_email_dispatch_failed job_id=%s", job_id)
     except Exception as error:
         logger.exception("shipment_status_summary_job_failed job_id=%s", job_id)
         try:
@@ -939,6 +978,14 @@ def run_discounted_orders_in_background(
                 "result": result,
             },
         )
+        send_job_completion_email(
+            settings,
+            job_id,
+            result,
+            settings.discounted_orders_email_to,
+            "Discounted orders",
+            "discounted_orders",
+        )
     except Exception as error:
         logger.exception("discounted_orders_job_failed job_id=%s", job_id)
         try:
@@ -957,18 +1004,66 @@ def run_discounted_orders_in_background(
 
 @app.get("/api/jobs/edd-breach/run", include_in_schema=False)
 async def run_shipment_edd_breach_job(
+    request: Request,
     dry_run: bool = Query(False),
 ):
+    require_vercel_cron_auth(request)
     return await execute_shipment_edd_breach_job(dry_run)
 
 
 @app.get("/api/jobs/data-retention/run", include_in_schema=False)
-def run_data_retention():
+def run_data_retention(request: Request):
+    require_vercel_cron_auth(request)
     try:
         return run_data_retention_job()
     except Exception as error:
         logger.exception("data_retention_job_failed")
         raise HTTPException(status_code=502, detail=f"Data retention job failed: {error}") from error
+
+
+@app.get("/api/jobs/shipment-status-summary/run", include_in_schema=False)
+async def run_shipment_status_summary_cron(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    require_vercel_cron_auth(request)
+    settings = get_edd_job_settings()
+    from_date, to_date = previous_30_day_range(settings)
+    return await get_shipment_status_summary(
+        background_tasks,
+        from_date=from_date,
+        to_date=to_date,
+        per_page=settings.per_page,
+    )
+
+
+@app.get("/api/jobs/discounted-orders/run", include_in_schema=False)
+async def run_discounted_orders_cron(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    require_vercel_cron_auth(request)
+    settings = get_edd_job_settings()
+    from_date, to_date = previous_30_day_range(settings)
+    return await get_discounted_orders(
+        background_tasks,
+        from_date=from_date,
+        to_date=to_date,
+        per_page=settings.per_page,
+    )
+
+
+@app.get("/api/jobs/shipment-movement-concerns/run", include_in_schema=False)
+async def run_shipment_movement_concerns_cron(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    require_vercel_cron_auth(request)
+    return await run_shipment_movement_concern_job_endpoint(
+        background_tasks,
+        dry_run=False,
+        awb_only=False,
+    )
 
 
 @app.post("/api/shipments/edd-breaches/run", summary="Run Shipment EDD Breach Job")
@@ -1092,8 +1187,16 @@ def run_movement_concern_job_in_background(job_id: str, dry_run: bool, awb_only:
             {"id": f"eq.{job_id}"},
             {"status": "running"},
         )
-        run_shipment_movement_concern_job(
+        result = run_shipment_movement_concern_job(
             dry_run=dry_run, awb_only=awb_only, job_run_id=job_id
+        )
+        send_job_completion_email(
+            settings,
+            job_id,
+            result,
+            settings.shipment_movement_concerns_email_to,
+            "Shipment movement concerns",
+            "movement_concerns",
         )
     except Exception as error:
         logger.exception("movement_concern_background_job_failed job_id=%s", job_id)
@@ -1116,7 +1219,15 @@ def run_edd_breach_job_in_background(job_id: str, dry_run: bool):
     supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
     try:
         supabase.update("shipment_edd_job_runs", {"id": f"eq.{job_id}"}, {"status": "running"})
-        run_edd_breach_job(dry_run=dry_run, job_run_id=job_id)
+        result = run_edd_breach_job(dry_run=dry_run, job_run_id=job_id)
+        send_job_completion_email(
+            settings,
+            job_id,
+            result,
+            settings.shipment_edd_breach_email_to,
+            "Shipment EDD breaches",
+            "edd_breach",
+        )
     except Exception as error:
         logger.exception("edd_breach_background_job_failed job_id=%s", job_id)
         try:

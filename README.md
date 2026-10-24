@@ -149,6 +149,17 @@ status URL to see whether the run is `queued`, `running`, `completed`, or
 `failed`, along with its result fields when complete. Job tracking requires
 Supabase configuration. Apply pending migrations before using this endpoint.
 
+Vercel Cron also runs the status summary, discounted orders, and movement
+concerns jobs daily. Status summary and discounted orders use the previous
+30 complete calendar days, ending yesterday in `EDD_JOB_TIMEZONE`; movement
+concerns uses its normal daily scan. The schedules in `vercel.json` are 20:00
+IST for status summary, 19:00 IST for discounted orders, and 21:00 IST for
+movement concerns. EDD breaches run at 22:00 IST; data retention runs at
+09:30 IST.
+Set `CRON_SECRET` in Vercel so its scheduled requests can authenticate. The
+existing EDD breach and data retention cron routes use the same secret. Vercel
+Cron runs only on production deployments.
+
 To find stuck or slow-moving shipments separately from EDD breaches:
 
 ```bash
@@ -185,9 +196,16 @@ GMAIL_APP_EMAIL=your-gmail-address@gmail.com
 GMAIL_APP_PASSWORD=your-16-character-google-app-password
 SHIPMENT_STATUS_SUMMARY_EMAIL_TO=recipient1@example.com,recipient2@example.com
 SHIPMENT_STATUS_SUMMARY_SKUS=Jewellery Chocolate:48297641869364,Bangle Box:BB-0024,Bangle Box:BB-0026
+DISCOUNTED_ORDERS_EMAIL_TO=orders@example.com
+EDD_BREACH_EMAIL_TO=shipping@example.com
+SHIPMENT_MOVEMENT_CONCERNS_EMAIL_TO=shipping@example.com
 ```
 
 Separate multiple recipients with commas or semicolons.
+The three additional `*_EMAIL_TO` settings route completion emails for
+`/api/orders/discounted`, `/api/shipments/edd-breaches/run`, and
+`/api/shipments/movement-concerns/run`, respectively. They use the same Gmail
+SMTP credentials above and accept comma-separated recipient lists.
 Separate SKU entries with commas and put a colon between each display name and
 its Shiprocket channel SKU. Entries with the same display name are grouped into
 one report, matching any of their listed SKU values.
@@ -206,8 +224,8 @@ curl -X POST http://localhost:8000/api/notifications/email/test \
 ```
 
 Create the app password in the Google Account used as `GMAIL_APP_EMAIL` and
-keep it secret. If any of these settings are missing, the summary job still
-completes and no email is sent.
+keep it secret. A job completes even if its recipient setting is empty; in that
+case, no email is sent for that job.
 
 ```http
 GET /api/shipments/status-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
