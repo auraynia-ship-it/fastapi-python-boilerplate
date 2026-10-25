@@ -11,19 +11,37 @@ from email.message import EmailMessage
 logger = logging.getLogger(__name__)
 
 
+def _human_label(value):
+    special = {
+        "awb": "AWB", "cod": "COD", "csv": "CSV", "edd": "EDD",
+        "id": "ID", "pdf": "PDF", "rto": "RTO", "sku": "SKU", "url": "URL",
+    }
+    return " ".join(
+        special.get(word.casefold(), word.capitalize())
+        for word in str(value).replace("_", " ").split()
+    )
+
+
+def _render_cell(value):
+    text = str(value)
+    if text.startswith(("https://", "http://")):
+        return f'<a href="{escape(text, quote=True)}" style="color:#2563eb">{escape(text)}</a>'
+    return escape(text)
+
+
 def _render_table(title, values):
     if not values:
         return ""
     rows = "".join(
         "<tr>"
-        f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">{escape(str(key))}</td>'
-        f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right">{escape(str(value))}</td>'
+        f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">{escape(_human_label(key))}</td>'
+        f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right">{_render_cell(value)}</td>'
         "</tr>"
         for key, value in values.items()
     )
     return (
         '<h2 style="font-size:16px;margin:24px 0 8px">'
-        f"{escape(title)}</h2>"
+        f"{escape(_human_label(title))}</h2>"
         '<table role="presentation" style="width:100%;border-collapse:collapse;'
         'background:#fff;border:1px solid #e5e7eb">'
         f"{rows}</table>"
@@ -68,7 +86,7 @@ def _summary_email_bodies(job_id, result):
         sku_sections.append(
             '<section style="margin-top:24px">'
             f'<h2 style="font-size:18px;margin:0 0 10px">{escape(str(name))}</h2>'
-            f'<table role="presentation" style="width:100%;border-collapse:collapse">{cards}</table>'
+            f'<table role="presentation" style="width:100%;border-collapse:collapse"><tr>{cards}</tr></table>'
             f"{_render_table('Packet status', packets)}"
             f"{_render_table('RTO status breakdown', rto_statuses)}"
             f"{_render_table('Ignored status breakdown', ignored_statuses)}"
@@ -115,14 +133,81 @@ def _generic_job_email_bodies(title, job_id, result):
         f"Complete result details (JSON):\n"
         f"{json.dumps(result, indent=2, ensure_ascii=False, default=str)}\n"
     )
-    detail_rows = "".join(
-        "<tr>"
-        f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;vertical-align:top">{escape(str(key))}</td>'
-        '<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">'
-        f'<pre style="white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:13px Arial,sans-serif">{escape(json.dumps(value, indent=2, ensure_ascii=False, default=str))}</pre>'
-        "</td></tr>"
-        for key, value in result.items()
+    metric_keys = (
+        "fetched_orders", "orders_fetched", "discounted_orders_count",
+        "shipments_checked", "breaches_found", "movement_concerns_found",
     )
+    metrics = [(key, result[key]) for key in metric_keys if key in result]
+    metric_cards = "".join(
+        '<td style="padding:12px;border:1px solid #e5e7eb;background:#fff;text-align:center">'
+        f'<div style="font-size:12px;color:#6b7280">{escape(_human_label(key))}</div>'
+        f'<div style="font-size:24px;font-weight:700;color:#111827">{escape(str(value))}</div></td>'
+        for key, value in metrics
+    )
+    metric_keys = {key for key, _ in metrics}
+    overview = {
+        _human_label(key): value
+        for key, value in result.items()
+        if key not in metric_keys and not isinstance(value, (dict, list, tuple))
+    }
+    sections = []
+    for key, value in result.items():
+        title_text = _human_label(key)
+        if isinstance(value, dict):
+            sections.append(_render_table(title_text, value))
+        elif isinstance(value, (list, tuple)):
+            if value and all(isinstance(item, dict) for item in value):
+                columns = list(dict.fromkeys(column for item in value for column in item))
+                headers = "".join(
+                    f'<th style="padding:8px 10px;text-align:left;background:#eff6ff;'
+                    f'border-bottom:1px solid #dbe3ee">{escape(_human_label(column))}</th>'
+                    for column in columns
+                )
+                rows = "".join(
+                    "<tr>" + "".join(
+                        '<td style="padding:8px 10px;border-bottom:1px solid #e5e7eb;vertical-align:top">'
+                        f"{escape(json.dumps(item.get(column), ensure_ascii=False, default=str) if isinstance(item.get(column), (dict, list)) else str(item.get(column, '-')))}</td>"
+                        for column in columns
+                    ) + "</tr>"
+                    for item in value
+                )
+                sections.append(
+                    f'<h2 style="font-size:16px;margin:24px 0 8px">{escape(title_text)} ({len(value)})</h2>'
+                    '<div style="overflow-x:auto"><table role="presentation" style="width:100%;'
+                    f'border-collapse:collapse;background:#fff;border:1px solid #e5e7eb">'
+                    f"<thead><tr>{headers}</tr></thead><tbody>{rows}</tbody></table></div>"
+                )
+            elif value:
+                if key in {"awb_codes", "breached_awbs"}:
+                    cells = [
+                        '<td style="padding:7px 10px;border:1px solid #e5e7eb;'
+                        'background:#fff;font-family:monospace">'
+                        f"{escape(str(item))}</td>"
+                        for item in value
+                    ]
+                    rows = "".join(
+                        "<tr>" + "".join(cells[index:index + 4]) + "</tr>"
+                        for index in range(0, len(cells), 4)
+                    )
+                    content = (
+                        '<div style="overflow-x:auto"><table role="presentation" '
+                        f'style="border-collapse:collapse"><tbody>{rows}</tbody></table></div>'
+                    )
+                else:
+                    items = "".join(
+                        '<li style="padding:3px 0;overflow-wrap:anywhere">'
+                        f"{escape(json.dumps(item, ensure_ascii=False, default=str) if isinstance(item, (dict, list)) else str(item))}</li>"
+                        for item in value
+                    )
+                    content = f'<ul style="margin:0;padding-left:20px;color:#374151">{items}</ul>'
+                sections.append(
+                    f'<h2 style="font-size:16px;margin:24px 0 8px">{escape(title_text)} ({len(value)})</h2>'
+                    f"{content}"
+                )
+            else:
+                sections.append(_render_table(title_text, {"Count": 0}))
+
+    overview_html = _render_table("Run details", overview) if overview else ""
     html_body = (
         '<div style="margin:0;background:#f3f4f6;padding:24px;font-family:Arial,sans-serif;'
         'color:#111827"><div style="max-width:760px;margin:0 auto;background:#f9fafb;'
@@ -130,10 +215,10 @@ def _generic_job_email_bodies(title, job_id, result):
         '<div style="font-size:12px;font-weight:700;letter-spacing:.08em;color:#2563eb;'
         'text-transform:uppercase">Job report</div>'
         f'<h1 style="font-size:24px;margin:8px 0 20px">{escape(title)} completed</h1>'
-        '<table role="presentation" style="width:100%;border-collapse:collapse;'
-        'background:#fff;border:1px solid #e5e7eb">'
-        f"{detail_rows}</table>"
-        '<div style="margin-top:24px;padding-top:16px;border-top:1px solid #d1d5db;'
+        + (f'<table role="presentation" style="width:100%;border-collapse:collapse"><tr>{metric_cards}</tr></table>' if metric_cards else "")
+        + overview_html
+        + "".join(sections)
+        + '<div style="margin-top:24px;padding-top:16px;border-top:1px solid #d1d5db;'
         'font-size:12px;color:#6b7280">'
         f"Job ID: {escape(str(job_id))}</div></div></div>"
     )

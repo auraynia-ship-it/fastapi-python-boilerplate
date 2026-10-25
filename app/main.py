@@ -845,7 +845,7 @@ def run_shipment_status_summary_in_background(
                 job_id,
                 result,
                 settings.shipment_status_summary_email_to,
-                "Shipment status summary",
+                None,
                 "shipment_status_summary",
             )
         except Exception:
