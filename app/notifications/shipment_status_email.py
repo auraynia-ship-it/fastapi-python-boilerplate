@@ -64,10 +64,13 @@ def _summary_email_bodies(job_id, result):
         rto_statuses = sku_summary.get("rto_statuses") or {}
         ignored_statuses = sku_summary.get("ignored_statuses") or {}
         name = sku_summary.get("name") or "Unnamed SKU"
+        rto_rate = sku_summary.get("rto_rate_percent")
+        rto_rate_display = f"{rto_rate:.2f}%" if rto_rate is not None else "N/A"
         text_body += (
             f"\n{name}\n"
             f"Matched packets: {sku_summary.get('matched_packets', 0)}\n"
             f"Ignored packets: {sku_summary.get('ignored_packets', 0)}\n"
+            f"RTO rate: {rto_rate_display}\n"
             f"Packet statuses: {json.dumps(packets, indent=2, ensure_ascii=False)}\n"
             f"RTO statuses: {json.dumps(rto_statuses, indent=2, ensure_ascii=False)}\n"
             f"Ignored statuses: {json.dumps(ignored_statuses, indent=2, ensure_ascii=False)}\n"
@@ -81,6 +84,7 @@ def _summary_email_bodies(job_id, result):
             for label, value in (
                 ("Matched packets", sku_summary.get("matched_packets", 0)),
                 ("Ignored packets", sku_summary.get("ignored_packets", 0)),
+                ("RTO rate", rto_rate_display),
             )
         )
         sku_sections.append(
@@ -134,7 +138,7 @@ def _generic_job_email_bodies(title, job_id, result):
         f"{json.dumps(result, indent=2, ensure_ascii=False, default=str)}\n"
     )
     metric_keys = (
-        "fetched_orders", "orders_fetched", "discounted_orders_count",
+        "fetched_orders", "orders_fetched", "discounted_orders_count", "lost_packets_count",
         "shipments_checked", "breaches_found", "movement_concerns_found",
     )
     metrics = [(key, result[key]) for key in metric_keys if key in result]

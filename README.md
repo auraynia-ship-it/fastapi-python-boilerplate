@@ -187,7 +187,10 @@ result show the display names and do not expose the SKU values. The request
 accepts only `from` and `to` dates. Job tracking requires Supabase and migration
 `009_shipment_status_summary_jobs.sql`. The result and completion email contain
 separate packet, RTO, and ignored-status breakdowns for each configured display
-name. When Gmail SMTP is configured, a completion email containing the full
+name. Each SKU section also shows only the RTO rate, calculated using orders
+whose Shiprocket `data[n].created_at` is before the four-day cutoff:
+`RTO / (delivered + RTO) * 100`. Recent orders are excluded from this rate;
+when no delivered or RTO orders qualify, the rate is shown as `N/A`. When Gmail SMTP is configured, a completion email containing the full
 summary result and job ID is sent after the result is saved. Set these
 environment variables in the deployment (or `.env` locally):
 
@@ -348,9 +351,20 @@ curl -X POST "http://localhost:3000/api/shipments/edd-breaches/run?dry_run=true"
 curl "http://localhost:3000/api/shipments/edd-breaches/runs/<job_id>"
 curl -X POST "http://localhost:3000/api/shipments/movement-concerns/run?dry_run=true"
 curl -X POST "http://localhost:3000/api/shipments/movement-concerns/run?dry_run=true&awb_only=true"
+curl "http://localhost:3000/api/shipments/lost-packets?from=2026-10-01&to=2026-10-25"
+curl "http://localhost:3000/api/shipments/lost-packets/runs/<job_id>"
 curl "http://localhost:3000/api/shipments/edd-breaches/health"
 curl -X POST "http://localhost:3000/api/shipments/edd-breaches/db/migrate"
 ```
+
+The lost-packets job fetches Shiprocket orders in the requested date range,
+keeps orders whose status is `Lost`, and returns AWB and order/customer details
+from the status URL. Each row includes SKU IDs and names matched from
+`SHIPMENT_STATUS_SUMMARY_SKUS`; unmatched SKUs are labeled `Unmatched`. The
+completion email includes the same SKU details. It uses the shared Gmail SMTP
+settings (`GMAIL_APP_EMAIL` and `GMAIL_APP_PASSWORD`) to the comma-separated
+`LOST_PACKETS_EMAIL_TO` recipients. Apply
+`db/migrations/012_lost_packets_jobs.sql` before using the endpoint.
 
 ## Demo
 

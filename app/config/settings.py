@@ -49,6 +49,7 @@ class EddJobSettings:
     discounted_orders_email_to: str | None
     shipment_edd_breach_email_to: str | None
     shipment_movement_concerns_email_to: str | None
+    lost_packets_email_to: str | None
 
 
 def _int_env(name, default):
@@ -96,4 +97,5 @@ def get_edd_job_settings():
         discounted_orders_email_to=os.getenv("DISCOUNTED_ORDERS_EMAIL_TO"),
         shipment_edd_breach_email_to=os.getenv("EDD_BREACH_EMAIL_TO"),
         shipment_movement_concerns_email_to=os.getenv("SHIPMENT_MOVEMENT_CONCERNS_EMAIL_TO"),
+        lost_packets_email_to=os.getenv("LOST_PACKETS_EMAIL_TO"),
     )
