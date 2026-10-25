@@ -203,6 +203,50 @@ def summarize_packets_by_status(orders, channel_sku):
     return summary, matched_packets, ignored_statuses, rto_statuses
 
 
+def parse_order_created_at(order, job_timezone):
+    value = order.get("created_at")
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        created_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        created_at = None
+        for date_format in (
+            "%d %b %Y, %I:%M %p",
+            "%d %B %Y, %I:%M %p",
+        ):
+            try:
+                created_at = datetime.strptime(value, date_format)
+                break
+            except ValueError:
+                continue
+        if created_at is None:
+            return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=job_timezone)
+    return created_at
+
+
+def summarize_rto_rate(orders, channel_skus, created_before, job_timezone):
+    delivered = 0
+    rto = 0
+    for order in orders:
+        if not isinstance(order, dict) or not order_has_channel_sku(order, channel_skus):
+            continue
+        created_at = parse_order_created_at(order, job_timezone)
+        if created_at is None or created_at.astimezone(job_timezone).date() >= created_before:
+            continue
+        bucket = classify_shipment_status(order.get("status"))
+        if bucket == "delivered":
+            delivered += 1
+        elif bucket == "rto":
+            rto += 1
+
+    denominator = delivered + rto
+    return round(rto / denominator * 100, 2) if denominator else None
+
+
 def parse_shipment_status_summary_skus(raw_value):
     """Parse comma-separated display-name:channel-sku entries."""
     configured_skus = []
@@ -809,10 +853,21 @@ def run_shipment_status_summary_in_background(
         configured_skus = parse_shipment_status_summary_skus(
             settings.shipment_status_summary_skus
         )
+        try:
+            job_timezone = ZoneInfo(settings.timezone)
+        except ZoneInfoNotFoundError:
+            job_timezone = timezone.utc
+        rto_rate_cutoff = datetime.now(job_timezone).date() - timedelta(days=4)
         sku_summaries = []
         for sku_name, channel_skus in group_shipment_status_summary_skus(configured_skus).items():
             summary, matched_packets, ignored_statuses, rto_statuses = summarize_packets_by_status(
                 orders, channel_skus
+            )
+            rto_rate = summarize_rto_rate(
+                orders,
+                channel_skus,
+                rto_rate_cutoff,
+                job_timezone,
             )
             sku_summaries.append({
                 "name": sku_name,
@@ -821,6 +876,7 @@ def run_shipment_status_summary_in_background(
                 "matched_packets": matched_packets,
                 "ignored_packets": sum(ignored_statuses.values()),
                 "ignored_statuses": ignored_statuses,
+                "rto_rate_percent": rto_rate,
             })
         result = {
             "from": from_date_value,
@@ -845,7 +901,7 @@ def run_shipment_status_summary_in_background(
                 job_id,
                 result,
                 settings.shipment_status_summary_email_to,
-                "Shipment status summary",
+                None,
                 "shipment_status_summary",
             )
         except Exception:
@@ -1000,6 +1056,157 @@ def run_discounted_orders_in_background(
             )
         except Exception:
             logger.exception("discounted_orders_job_status_update_failed job_id=%s", job_id)
+
+
+@app.get("/api/shipments/lost-packets", summary="Find Lost Shipments")
+async def get_lost_packets(
+    background_tasks: BackgroundTasks,
+    from_date: date = Query(..., alias="from"),
+    to_date: date = Query(..., alias="to"),
+    per_page: int = Query(100, ge=1, le=100),
+):
+    if from_date > to_date:
+        raise HTTPException(status_code=400, detail="from date must be less than or equal to to date.")
+
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is required to track background jobs")
+
+    job_id = str(uuid4())
+    try:
+        supabase.insert("lost_packets_job_runs", {
+            "id": job_id,
+            "status": "queued",
+            "from_date": from_date.isoformat(),
+            "to_date": to_date.isoformat(),
+            "per_page": per_page,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as error:
+        logger.exception("lost_packets_queue_failed")
+        raise HTTPException(status_code=502, detail=f"Unable to queue lost packets job: {error}") from error
+
+    background_tasks.add_task(
+        run_lost_packets_in_background,
+        job_id,
+        from_date.isoformat(),
+        to_date.isoformat(),
+        per_page,
+    )
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/api/shipments/lost-packets/runs/{job_id}",
+    })
+
+
+@app.get("/api/shipments/lost-packets/runs/{job_id}", summary="Get Lost Packets Job Status")
+def get_lost_packets_job_status(job_id: str):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    if not supabase.enabled:
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+    try:
+        rows = supabase.get("lost_packets_job_runs", {"id": f"eq.{job_id}"})
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Unable to read job status: {error}") from error
+    if not rows:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return rows[0]
+
+
+def summarize_lost_packet(order, configured_sku_names):
+    shipments = []
+    for key in ("shipments", "shipment", "shipment_details", "shipments_details"):
+        value = order.get(key)
+        if isinstance(value, list):
+            shipments.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            shipments.append(value)
+    shipment = shipments[0] if shipments else {}
+    customer = order.get("customer") if isinstance(order.get("customer"), dict) else {}
+    products = order.get("products") if isinstance(order.get("products"), list) else []
+    sku_matches = []
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        sku_id = product.get("channel_sku") or product.get("sku")
+        if sku_id in (None, ""):
+            continue
+        sku_id = str(sku_id).strip()
+        sku_matches.append({
+            "sku_id": sku_id,
+            "sku_name": configured_sku_names.get(sku_id),
+        })
+    return {
+        "order_id": order.get("id") or order.get("order_id"),
+        "channel_order_id": order.get("channel_order_id"),
+        "awb": next(
+            (source.get(key) for source in (shipment, order)
+             for key in ("awb_code", "awb", "awb_number") if source.get(key)),
+            None,
+        ),
+        "status": order.get("status"),
+        "created_at": order.get("created_at"),
+        "customer_name": order.get("customer_name") or customer.get("name"),
+        "customer_email": order.get("customer_email") or customer.get("email"),
+        "customer_phone": order.get("customer_phone") or customer.get("phone"),
+        "courier": shipment.get("courier") or shipment.get("courier_name"),
+        "sku_id": ", ".join(item["sku_id"] for item in sku_matches),
+        "sku_name": ", ".join(
+            item["sku_name"] or "Unmatched" for item in sku_matches
+        ),
+        "skus": sku_matches,
+    }
+
+
+def run_lost_packets_in_background(job_id: str, from_date_value: str, to_date_value: str, per_page: int):
+    settings = get_edd_job_settings()
+    supabase = SupabaseRestClient(settings.supabase_url, settings.supabase_key)
+    try:
+        supabase.update("lost_packets_job_runs", {"id": f"eq.{job_id}"}, {"status": "running"})
+        orders = get_shiprocket_client().fetch_orders(
+            start_date=date.fromisoformat(from_date_value),
+            end_date=date.fromisoformat(to_date_value),
+            max_pages=None,
+            per_page=per_page,
+        )
+        configured_sku_names = {
+            item["channel_sku"]: item["name"]
+            for item in parse_shipment_status_summary_skus(settings.shipment_status_summary_skus)
+        }
+        lost_packets = [
+            summarize_lost_packet(order, configured_sku_names) for order in orders
+            if isinstance(order, dict) and str(order.get("status") or "").strip().casefold() == "lost"
+        ]
+        result = {
+            "from": from_date_value,
+            "to": to_date_value,
+            "fetched_orders": len(orders),
+            "lost_packets_count": len(lost_packets),
+            "lost_packets": lost_packets,
+        }
+        supabase.update("lost_packets_job_runs", {"id": f"eq.{job_id}"}, {
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "fetched_orders": len(orders),
+            "lost_packets_count": len(lost_packets),
+            "result": result,
+        })
+        send_job_completion_email(
+            settings, job_id, result, settings.lost_packets_email_to, "Lost packets", "lost_packets"
+        )
+    except Exception as error:
+        logger.exception("lost_packets_job_failed job_id=%s", job_id)
+        try:
+            supabase.update("lost_packets_job_runs", {"id": f"eq.{job_id}"}, {
+                "status": "failed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error_message": str(error),
+            })
+        except Exception:
+            logger.exception("lost_packets_job_status_update_failed job_id=%s", job_id)
 
 
 @app.get("/api/jobs/edd-breach/run", include_in_schema=False)
