@@ -182,8 +182,9 @@ The shipment status summary endpoint also runs asynchronously. It returns
 `202 Accepted` with a `job_id` and `status_url`; poll the status URL for the
 final summary. It reads `SHIPMENT_STATUS_SUMMARY_SKUS` from the environment
 and accepts only `from` and `to` dates in the request.
-Configure comma-separated `display name:channel SKU` pairs; the email and job
-result show the display names and do not expose the SKU values. The request
+Configure comma-separated `display name:channel SKU` pairs; entries sharing a
+display name are combined into one section, and each section lists its SKU IDs.
+Matching checks Shiprocket `products` and channel `order_items`. The request
 accepts only `from` and `to` dates. Job tracking requires Supabase and migration
 `009_shipment_status_summary_jobs.sql`. The result and completion email contain
 separate packet, RTO, and ignored-status breakdowns for each configured display
