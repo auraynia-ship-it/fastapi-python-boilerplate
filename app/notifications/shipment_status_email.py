@@ -66,8 +66,10 @@ def _summary_email_bodies(job_id, result):
         name = sku_summary.get("name") or "Unnamed SKU"
         rto_rate = sku_summary.get("rto_rate_percent")
         rto_rate_display = f"{rto_rate:.2f}%" if rto_rate is not None else "N/A"
+        sku_ids = sku_summary.get("sku_ids") or []
         text_body += (
             f"\n{name}\n"
+            f"SKU IDs: {', '.join(str(value) for value in sku_ids)}\n"
             f"Matched packets: {sku_summary.get('matched_packets', 0)}\n"
             f"Ignored packets: {sku_summary.get('ignored_packets', 0)}\n"
             f"RTO rate: {rto_rate_display}\n"
@@ -90,6 +92,7 @@ def _summary_email_bodies(job_id, result):
         sku_sections.append(
             '<section style="margin-top:24px">'
             f'<h2 style="font-size:18px;margin:0 0 10px">{escape(str(name))}</h2>'
+            f'<p style="margin:0 0 10px;color:#4b5563;font-size:13px">SKU IDs: {escape(", ".join(str(value) for value in sku_ids))}</p>'
             f'<table role="presentation" style="width:100%;border-collapse:collapse"><tr>{cards}</tr></table>'
             f"{_render_table('Packet status', packets)}"
             f"{_render_table('RTO status breakdown', rto_statuses)}"

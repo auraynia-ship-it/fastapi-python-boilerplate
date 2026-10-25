@@ -152,18 +152,26 @@ def order_has_channel_sku(order, channel_sku):
     expected_skus = {str(value).strip().casefold() for value in sku_values if str(value).strip()}
     if not expected_skus:
         return False
-    products = order.get("products", [])
-    if not isinstance(products, list):
-        return False
+    return bool(expected_skus.intersection(get_order_sku_values(order)))
 
-    for product in products:
-        if not isinstance(product, dict):
+
+def get_order_sku_values(order):
+    """Collect SKU identifiers across Shiprocket and channel order payload shapes."""
+    product_lists = [order.get("products"), order.get("line_items")]
+    others = order.get("others") if isinstance(order.get("others"), dict) else {}
+    product_lists.append(others.get("order_items"))
+    sku_values = set()
+    for products in product_lists:
+        if not isinstance(products, list):
             continue
-        product_sku = str(product.get("channel_sku", "")).strip().casefold()
-        if product_sku in expected_skus:
-            return True
-
-    return False
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            for key in ("channel_sku", "sku", "sku_code", "product_sku", "variant_sku"):
+                value = product.get(key)
+                if value not in (None, ""):
+                    sku_values.add(str(value).strip().casefold())
+    return sku_values
 
 
 def classify_shipment_status(status):
@@ -871,6 +879,7 @@ def run_shipment_status_summary_in_background(
             )
             sku_summaries.append({
                 "name": sku_name,
+                "sku_ids": channel_skus,
                 "packets": summary,
                 "rto_statuses": rto_statuses,
                 "matched_packets": matched_packets,
